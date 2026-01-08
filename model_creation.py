@@ -41,90 +41,16 @@ import gmsh
 import opstool as opst
 
 
-def apply_surface_load(mesh, load_configs):
-    """
-    Apply surface load to shell elements using opstool
-    
-    Parameters
-    ----------
-    mesh : dict
-        Mesh dictionary with 'quad4' and 'tri3' elements
-    load_configs : dict
-        Load configuration dictionary with keys:
-        - 'pressure': float - Pressure load (negative for downward, e.g., -1000 Pa)
-        - 'time_series_tag': int - Time series tag
-        - 'pattern_tag': int - Pattern tag
-        - 'element_tags': list - Specific elements (None = all elements)
-    """
-    import openseespy.opensees as ops
-    try:
-        import opstool as opst
-    except ImportError:
-        raise ImportError("opstool is required for surface loads. Install: pip install opstool")
-    
- 
-    # Extract load parameters - NO DEFAULTS, user must provide all
-    load_pressure = load_configs['pressure']
-    time_series_tag = load_configs['time_series_tag']
-    pattern_tag = load_configs['pattern_tag']
-    element_tags = load_configs.get('element_tags')  # Can be None for all elements
-    
-    if load_pressure is None:
-        print("WARNING: No pressure specified in load_configs")
-        return
-    
-    # Create time series and pattern
-    ops.timeSeries("Linear", time_series_tag)
-    ops.pattern("Plain", pattern_tag, time_series_tag)
-    
-    # Get all element tags if not specified
-    if element_tags is None:
-        element_tags = [elem['tag'] for elem in mesh['quad4']]
-        element_tags += [elem['tag'] for elem in mesh['tri3']]
-    
-    # Apply surface load using opstool
-    opst.pre.transform_surface_uniform_load(ele_tags=element_tags, p=load_pressure)
-    
-    print(f"\nSurface load applied:")
-    print(f"  Pattern tag: {pattern_tag}")
-    print(f"  Time series tag: {time_series_tag}")
-    print(f"  Pressure: {load_pressure}")
-    print(f"  Elements: {len(element_tags)}")
+
 
 def generate_mesh(boundary_nodes, mesh_size, internal_points=None, voids=None,
                   py_file="model.py", png_file="mesh.png",
                   material_E=2e11, material_nu=0.3, material_rho=7850,
-                  thickness=0.01, node_font_size=7, element_font_size=6, start_node_id = 20000, start_element_id=20000):
+                  thickness=0.01, node_font_size=7, element_font_size=6, 
+                  start_node_id=20000, start_element_id=20000):
     """
-    Generate mesh from boundary nodes with support for voids and create OpenSeesPy file.
-    
-    Parameters
-    ----------
-    boundary_nodes : dict
-        {node_id: (x, y, z)} - minimum 3 nodes
-    mesh_size : float
-        Element size
-    internal_points : dict, optional
-        {point_id: (x, y, z)}
-    voids : list of dict, optional
-        List of void definitions, each dict: {node_id: (x, y, z)}
-        Example: [void1_dict, void2_dict]
-    py_file : str
-        Output Python file path
-    png_file : str
-        Output visualization file path
-    material_E : float
-        Young's modulus (Pa)
-    material_nu : float
-        Poisson's ratio
-    material_rho : float
-        Density (kg/m³)
-    thickness : float
-        Plate thickness (m)
-    node_font_size : int
-        Font size for node numbers (default: 7)
-    element_font_size : int
-        Font size for element numbers (default: 6)
+    Generate mesh - NO DUPLICATE NODES
+    Internal points (100, 101) keep their original IDs
     """
     
     # Step 1: Create GMSH geometry
@@ -152,19 +78,13 @@ def generate_mesh(boundary_nodes, mesh_size, internal_points=None, voids=None,
         line = gmsh.model.geo.addLine(point_map[start], point_map[end])
         boundary_lines.append(line)
     
-    # Create outer boundary loop
     outer_loop = gmsh.model.geo.addCurveLoop(boundary_lines)
     
     # Process voids
     void_loops = []
-    void_point_maps = []
-    
     if voids:
         print(f"\nProcessing {len(voids)} voids:")
         for void_idx, void_nodes in enumerate(voids):
-            print(f"  Void {void_idx + 1}: {len(void_nodes)} nodes")
-            
-            # Sort void nodes by angle (around their own center)
             void_coords = np.array([void_nodes[nid] for nid in sorted(void_nodes.keys())])
             void_center = void_coords.mean(axis=0)
             void_angles = np.arctan2(void_coords[:, 1] - void_center[1], 
@@ -172,16 +92,12 @@ def generate_mesh(boundary_nodes, mesh_size, internal_points=None, voids=None,
             void_sorted_indices = np.argsort(void_angles)
             void_sorted_ids = [sorted(void_nodes.keys())[i] for i in void_sorted_indices]
             
-            # Create void points and lines
             void_point_map = {}
             for node_id in void_sorted_ids:
                 x, y, z = void_nodes[node_id]
                 pt = gmsh.model.geo.addPoint(x, y, z, mesh_size)
                 void_point_map[node_id] = pt
             
-            void_point_maps.append(void_point_map)
-            
-            # Create void boundary lines
             void_lines = []
             for i in range(len(void_sorted_ids)):
                 start = void_sorted_ids[i]
@@ -189,563 +105,262 @@ def generate_mesh(boundary_nodes, mesh_size, internal_points=None, voids=None,
                 line = gmsh.model.geo.addLine(void_point_map[start], void_point_map[end])
                 void_lines.append(line)
             
-            # Create void loop
             void_loop = gmsh.model.geo.addCurveLoop(void_lines)
             void_loops.append(void_loop)
     
-    # Create surface with voids (outer loop minus void loops)
     all_loops = [outer_loop] + void_loops
     surface = gmsh.model.geo.addPlaneSurface(all_loops)
     
-    # Validate geometry before meshing
-    if voids and internal_points:
-        print("\nValidating geometry...")
-        
-        def point_in_polygon(point, polygon):
-            """Check if point is inside polygon using ray casting algorithm"""
-            x, y = point[0], point[1]
-            n = len(polygon)
-            inside = False
-            
-            p1x, p1y = polygon[0]
-            for i in range(1, n + 1):
-                p2x, p2y = polygon[i % n]
-                if y > min(p1y, p2y):
-                    if y <= max(p1y, p2y):
-                        if x <= max(p1x, p2x):
-                            if p1y != p2y:
-                                xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
-                            if p1x == p2x or x <= xinters:
-                                inside = not inside
-                p1x, p1y = p2x, p2y
-            
-            return inside
-        
-        def distance_to_polygon(point, polygon):
-            """Calculate minimum distance from point to polygon edges"""
-            min_dist = float('inf')
-            n = len(polygon)
-            
-            for i in range(n):
-                p1 = np.array(polygon[i])
-                p2 = np.array(polygon[(i + 1) % n])
-                
-                # Vector from p1 to p2
-                edge = p2 - p1
-                edge_len = np.linalg.norm(edge)
-                
-                if edge_len == 0:
-                    dist = np.linalg.norm(point - p1)
-                else:
-                    # Parameter t for closest point on line segment
-                    t = max(0, min(1, np.dot(point - p1, edge) / (edge_len ** 2)))
-                    closest = p1 + t * edge
-                    dist = np.linalg.norm(point - closest)
-                
-                min_dist = min(min_dist, dist)
-            
-            return min_dist
-        
-        points_to_remove = []
-        for int_id, int_coord in internal_points.items():
-            int_point = np.array(int_coord[:2])
-            should_remove = False
-            
-            # Check if internal point is inside any void
-            for void_idx, void_nodes in enumerate(voids):
-                # Get void coordinates in order
-                void_coords_list = [void_nodes[n][:2] for n in sorted(void_nodes.keys())]
-                void_coords = np.array(void_coords_list)
-                
-                # Check if point is inside void polygon
-                if point_in_polygon(int_point, void_coords):
-                    print(f"  ERROR: Internal point {int_id} is INSIDE void {void_idx + 1}")
-                    print(f"    Point: ({int_coord[0]:.3f}, {int_coord[1]:.3f})")
-                    print(f"    This point MUST be REMOVED to prevent meshing errors")
-                    should_remove = True
-                    break
-                
-                # Calculate distance to void boundary
-                dist_to_boundary = distance_to_polygon(int_point, void_coords_list)
-                
-                # Minimum safe distance: 1.5 * mesh_size
-                min_safe_distance = mesh_size * 1.5
-                
-                if dist_to_boundary < min_safe_distance:
-                    print(f"  ERROR: Internal point {int_id} is TOO CLOSE to void {void_idx + 1}")
-                    print(f"    Distance to void boundary: {dist_to_boundary:.4f}")
-                    print(f"    Minimum safe distance: {min_safe_distance:.4f}")
-                    print(f"    This point MUST be REMOVED to prevent meshing errors")
-                    should_remove = True
-                    break
-                
-                # Warn if within caution zone (1.5x to 2x mesh_size)
-                elif dist_to_boundary < mesh_size * 2.0:
-                    print(f"  WARNING: Internal point {int_id} is close to void {void_idx + 1}")
-                    print(f"    Distance to void boundary: {dist_to_boundary:.4f}")
-                    print(f"    Recommended minimum: {mesh_size * 2.0:.4f}")
-                    print(f"    Meshing may succeed but quality may be poor")
-            
-            if should_remove:
-                points_to_remove.append(int_id)
-        
-        # Remove problematic points
-        if points_to_remove:
-            print(f"\n  >>> Automatically removing {len(points_to_remove)} problematic internal points <<<")
-            for pt_id in points_to_remove:
-                print(f"      Removed point {pt_id}")
-                del internal_points[pt_id]
-            
-            if len(internal_points) == 0:
-                internal_points = None
-                print(f"  >>> All internal points removed. Proceeding without internal points <<<")
-    
-    # Synchronize BEFORE creating internal points
     gmsh.model.geo.synchronize()
     
-    # Add internal points to the surface AFTER synchronization
-    internal_point_map = {}
+    # Embed internal points
     if internal_points:
         print(f"\nEmbedding {len(internal_points)} internal points:")
         for node_id, coord in internal_points.items():
             x, y, z = coord
-            # Create point in the geometry
             pt = gmsh.model.geo.addPoint(x, y, z, mesh_size)
-            internal_point_map[node_id] = pt
-        
-        # Synchronize after creating all points
-        gmsh.model.geo.synchronize()
-        
-        # Now embed the points in the surface
-        for node_id, pt in internal_point_map.items():
+            gmsh.model.geo.synchronize()
             try:
                 gmsh.model.mesh.embed(0, [pt], 2, surface)
-                print(f"  Internal point {node_id} embedded successfully")
+                print(f"  ✓ Embedded point {node_id}")
             except Exception as e:
-                print(f"  WARNING: Could not embed internal point {node_id}: {e}")
-                print(f"    This point may be inside a void or on a boundary")
+                print(f"  ✗ Failed: {node_id}")
     
-    # Step 2: Generate mesh with better algorithm settings
-    gmsh.option.setNumber("Mesh.Algorithm", 6)  # Frontal-Delaunay for 2D
+    # Generate mesh
+    gmsh.option.setNumber("Mesh.Algorithm", 6)
     gmsh.option.setNumber("Mesh.RecombineAll", 1)
     gmsh.option.setNumber("Mesh.RecombinationAlgorithm", 1)
     gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_size * 0.5)
     gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_size * 2)
     
-    mesh_success = False
-    attempt = 1
-    
-    # Attempt 1: Frontal-Delaunay with recombination
     try:
-        print(f"\nAttempt {attempt}: Meshing with Frontal-Delaunay algorithm...")
+        print(f"\nMeshing with Frontal-Delaunay...")
         gmsh.model.mesh.generate(2)
-        mesh_success = True
-        print("  ✓ Meshing successful!")
-    except Exception as e:
-        print(f"  ✗ Failed: {str(e)[:100]}")
-        attempt += 1
-        
-        # Attempt 2: Delaunay without recombination
-        try:
-            print(f"\nAttempt {attempt}: Trying Delaunay algorithm without recombination...")
-            gmsh.model.mesh.clear()
-            gmsh.option.setNumber("Mesh.Algorithm", 5)  # Delaunay
-            gmsh.option.setNumber("Mesh.RecombineAll", 0)  # Disable recombination
-            gmsh.model.mesh.generate(2)
-            mesh_success = True
-            print("  ✓ Meshing successful!")
-        except Exception as e2:
-            print(f"  ✗ Failed: {str(e2)[:100]}")
-            attempt += 1
-            
-            # Attempt 3: MeshAdapt algorithm
-            try:
-                print(f"\nAttempt {attempt}: Trying MeshAdapt algorithm...")
-                gmsh.model.mesh.clear()
-                gmsh.option.setNumber("Mesh.Algorithm", 1)  # MeshAdapt
-                gmsh.option.setNumber("Mesh.RecombineAll", 0)
-                gmsh.model.mesh.generate(2)
-                mesh_success = True
-                print("  ✓ Meshing successful!")
-            except Exception as e3:
-                print(f"  ✗ Failed: {str(e3)[:100]}")
-                
-                # Last resort: If internal points exist, try without them
-                if internal_point_map:
-                    attempt += 1
-                    print(f"\n{'-'*60}")
-                    print(f"All meshing attempts failed with internal points.")
-                    print(f"Attempting final mesh WITHOUT internal points...")
-                    print(f"{'-'*60}")
-                    
-                    # Rebuild geometry without internal points
-                    gmsh.finalize()
-                    gmsh.initialize()
-                    gmsh.model.add("mesh_retry")
-                    
-                    # Recreate boundary
-                    point_map_retry = {}
-                    for node_id in sorted_ids:
-                        x, y, z = boundary_nodes[node_id]
-                        pt = gmsh.model.geo.addPoint(x, y, z, mesh_size)
-                        point_map_retry[node_id] = pt
-                    
-                    lines_retry = []
-                    for i in range(len(sorted_ids)):
-                        start = sorted_ids[i]
-                        end = sorted_ids[(i + 1) % len(sorted_ids)]
-                        line = gmsh.model.geo.addLine(point_map_retry[start], point_map_retry[end])
-                        lines_retry.append(line)
-                    
-                    outer_loop_retry = gmsh.model.geo.addCurveLoop(lines_retry)
-                    
-                    # Recreate voids
-                    void_loops_retry = []
-                    if voids:
-                        for void_nodes in voids:
-                            void_coords = np.array([void_nodes[nid] for nid in sorted(void_nodes.keys())])
-                            void_center = void_coords.mean(axis=0)
-                            void_angles = np.arctan2(void_coords[:, 1] - void_center[1], 
-                                                     void_coords[:, 0] - void_center[0])
-                            void_sorted_indices = np.argsort(void_angles)
-                            void_sorted_ids = [sorted(void_nodes.keys())[i] for i in void_sorted_indices]
-                            
-                            void_point_map = {}
-                            for node_id in void_sorted_ids:
-                                x, y, z = void_nodes[node_id]
-                                pt = gmsh.model.geo.addPoint(x, y, z, mesh_size)
-                                void_point_map[node_id] = pt
-                            
-                            void_lines = []
-                            for i in range(len(void_sorted_ids)):
-                                start = void_sorted_ids[i]
-                                end = void_sorted_ids[(i + 1) % len(void_sorted_ids)]
-                                line = gmsh.model.geo.addLine(void_point_map[start], void_point_map[end])
-                                void_lines.append(line)
-                            
-                            void_loop = gmsh.model.geo.addCurveLoop(void_lines)
-                            void_loops_retry.append(void_loop)
-                    
-                    all_loops_retry = [outer_loop_retry] + void_loops_retry
-                    surface_retry = gmsh.model.geo.addPlaneSurface(all_loops_retry)
-                    gmsh.model.geo.synchronize()
-                    
-                    # Try meshing without internal points
-                    try:
-                        print(f"Attempt {attempt}: Meshing WITHOUT internal points...")
-                        gmsh.option.setNumber("Mesh.Algorithm", 5)
-                        gmsh.option.setNumber("Mesh.RecombineAll", 0)
-                        gmsh.model.mesh.generate(2)
-                        mesh_success = True
-                        internal_point_map = {}  # Clear internal points
-                        print("  ✓ Meshing successful WITHOUT internal points!")
-                        print(f"  Note: All internal points were excluded to enable meshing")
-                    except Exception as e4:
-                        gmsh.finalize()
-                        raise Exception(f"Mesh generation failed after all attempts: {e4}")
-                else:
-                    gmsh.finalize()
-                    raise Exception(f"Mesh generation failed: {e3}")
+        print("  ✓ Success!")
+    except:
+        gmsh.model.mesh.clear()
+        gmsh.option.setNumber("Mesh.Algorithm", 5)
+        gmsh.option.setNumber("Mesh.RecombineAll", 0)
+        gmsh.model.mesh.generate(2)
+        print("  ✓ Success with Delaunay!")
     
-    if not mesh_success:
-        gmsh.finalize()
-        raise Exception("Unexpected meshing failure")
-    
-    # Step 3: Extract mesh data
-    # node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
-    # temp_nodes = {}
-    # for i, tag in enumerate(node_tags):
-    #     temp_nodes[int(tag)] = (node_coords[3*i], node_coords[3*i+1], node_coords[3*i+2])
-
-    # Step 3: Extract mesh data (existing code)
+    # Extract mesh (NO sequential remapping)
     node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
     temp_nodes = {}
     for i, tag in enumerate(node_tags):
         temp_nodes[int(tag)] = (node_coords[3*i], node_coords[3*i+1], node_coords[3*i+2])
 
-    # NEW: Create sequential node ID mapping
-    gmsh_node_ids = sorted(temp_nodes.keys())
-    gmsh_to_new_id = {old_id: start_node_id + i for i, old_id in enumerate(gmsh_node_ids)}
-
-    # Update temp_nodes with new IDs
-    temp_nodes = {gmsh_to_new_id[old_id]: coord for old_id, coord in temp_nodes.items()}
-    
     # Get elements
-    # quad4_elems = []
-    # tri3_elems = []
-    
-    # for elem_type in gmsh.model.mesh.getElementTypes(dim=2):
-    #     elem_tags, elem_nodes = gmsh.model.mesh.getElementsByType(elem_type)
-        
-    #     if elem_type == 3:  # Quad4
-        #     for i, tag in enumerate(elem_tags):
-        #         nodes = [int(elem_nodes[i*4 + j]) for j in range(4)]
-        #         quad4_elems.append({'tag': int(tag), 'nodes': nodes})
-        # elif elem_type == 2:  # Tri3
-        #     for i, tag in enumerate(elem_tags):
-        #         nodes = [int(elem_nodes[i*3 + j]) for j in range(3)]
-        #         tri3_elems.append({'tag': int(tag), 'nodes': nodes})
-
-    # Get elements (existing code location)
     quad4_elems = []
     tri3_elems = []
-
-    element_counter = start_element_id  # ADD THIS
 
     for elem_type in gmsh.model.mesh.getElementTypes(dim=2):
         elem_tags, elem_nodes = gmsh.model.mesh.getElementsByType(elem_type)
         
         if elem_type == 3:  # Quad4
             for i, tag in enumerate(elem_tags):
-                nodes = [gmsh_to_new_id[int(elem_nodes[i*4 + j])] for j in range(4)]  # MODIFIED
-                quad4_elems.append({'tag': element_counter, 'nodes': nodes})  # MODIFIED
-                element_counter += 1  # ADD THIS
+                nodes = [int(elem_nodes[i*4 + j]) for j in range(4)]
+                quad4_elems.append({'tag': int(tag), 'nodes': nodes})
         elif elem_type == 2:  # Tri3
             for i, tag in enumerate(elem_tags):
-                nodes = [gmsh_to_new_id[int(elem_nodes[i*3 + j])] for j in range(3)]  # MODIFIED
-                tri3_elems.append({'tag': element_counter, 'nodes': nodes})  # MODIFIED
-                element_counter += 1  # ADD THIS
-
-    
+                nodes = [int(elem_nodes[i*3 + j]) for j in range(3)]
+                tri3_elems.append({'tag': int(tag), 'nodes': nodes})
     
     gmsh.finalize()
     
-    # Step 4: Match boundary nodes
+    # NODE MAPPING - PRESERVE SPECIAL IDs
     tolerance = mesh_size * 0.01
     node_map = {}
     final_nodes = {}
-    used_boundary = set()
+    used_ids = set()
     
-    for gmsh_id, gmsh_coord in temp_nodes.items():
-        matched = False
-        
-        # Try to match with boundary nodes
-        for bnd_id, bnd_coord in boundary_nodes.items():
-            if bnd_id in used_boundary:
+    # Match boundary nodes
+    for bnd_id, bnd_coord in boundary_nodes.items():
+        best = None
+        best_dist = float('inf')
+        for gid, gcoord in temp_nodes.items():
+            if gid in node_map:
                 continue
-            dist = np.linalg.norm(np.array(gmsh_coord) - np.array(bnd_coord))
-            if dist < tolerance:
-                node_map[gmsh_id] = bnd_id
-                final_nodes[bnd_id] = bnd_coord
-                used_boundary.add(bnd_id)
-                matched = True
-                break
-        
-        # Try to match with void boundary nodes
-        if not matched and voids:
-            for void_nodes in voids:
-                for void_id, void_coord in void_nodes.items():
-                    if void_id in used_boundary:
-                        continue
-                    dist = np.linalg.norm(np.array(gmsh_coord) - np.array(void_coord))
-                    if dist < tolerance:
-                        node_map[gmsh_id] = void_id
-                        final_nodes[void_id] = void_coord
-                        used_boundary.add(void_id)
-                        matched = True
-                        break
-                if matched:
-                    break
-        
-        if not matched:
-            node_map[gmsh_id] = gmsh_id
-            final_nodes[gmsh_id] = gmsh_coord
+            dist = np.linalg.norm(np.array(gcoord) - np.array(bnd_coord))
+            if dist < tolerance and dist < best_dist:
+                best = gid
+                best_dist = dist
+        if best:
+            node_map[best] = bnd_id
+            final_nodes[bnd_id] = bnd_coord
+            used_ids.add(bnd_id)
     
-    # Step 5: Match embedded internal points
-    if internal_points:
-        print(f"\nMatching {len(internal_points)} embedded internal points:")
-        
-        # Create a reverse mapping of coordinates to GMSH IDs
-        coord_to_gmsh = {}
-        for gmsh_id, gmsh_coord in temp_nodes.items():
-            rounded_coord = tuple(round(c, 12) for c in gmsh_coord)
-            coord_to_gmsh[rounded_coord] = gmsh_id
-        
-        matched_internal = set()
-        
-        for int_id, int_coord in internal_points.items():
-            rounded_int_coord = tuple(round(c, 12) for c in int_coord)
-            
-            if rounded_int_coord in coord_to_gmsh:
-                gmsh_id = coord_to_gmsh[rounded_int_coord]
-                
-                if gmsh_id in node_map and node_map[gmsh_id] in used_boundary:
-                    print(f"  WARNING: Internal point {int_id} coincides with boundary node {node_map[gmsh_id]}")
-                    matched_internal.add(int_id)
-                    continue
-                
-                if gmsh_id in node_map and node_map[gmsh_id] != gmsh_id:
-                    print(f"  WARNING: Internal point {int_id} location already occupied by node {node_map[gmsh_id]}")
-                    max_id = max(list(final_nodes.keys()) + list(internal_points.keys()))
-                    new_gmsh_id = max_id + 10000
-                    node_map[new_gmsh_id] = int_id
-                    final_nodes[int_id] = int_coord
-                else:
-                    node_map[gmsh_id] = int_id
-                    final_nodes[int_id] = int_coord
-                
-                matched_internal.add(int_id)
-                print(f"  Internal point {int_id} → exact match at GMSH node {gmsh_id}")
-            else:
-                # Tolerance-based matching as fallback
-                best_match = None
+    # Match void nodes
+    if voids:
+        for void_nodes in voids:
+            for void_id, void_coord in void_nodes.items():
+                best = None
                 best_dist = float('inf')
-                
-                for gmsh_id, gmsh_coord in temp_nodes.items():
-                    if gmsh_id in node_map and node_map[gmsh_id] in used_boundary:
+                for gid, gcoord in temp_nodes.items():
+                    if gid in node_map:
                         continue
-                    
-                    dist = np.linalg.norm(np.array(gmsh_coord) - np.array(int_coord))
+                    dist = np.linalg.norm(np.array(gcoord) - np.array(void_coord))
                     if dist < tolerance and dist < best_dist:
-                        best_match = gmsh_id
+                        best = gid
                         best_dist = dist
-                
-                if best_match is not None:
-                    node_map[best_match] = int_id
-                    final_nodes[int_id] = int_coord
-                    matched_internal.add(int_id)
-                    print(f"  Internal point {int_id} → tolerance match (dist={best_dist:.6f})")
-                else:
-                    print(f"  WARNING: Internal point {int_id} not found in mesh")
+                if best:
+                    node_map[best] = void_id
+                    final_nodes[void_id] = void_coord
+                    used_ids.add(void_id)
     
-    # Step 6: Check for duplicate node IDs
-    node_id_counts = {}
-    for gmsh_id, mapped_id in node_map.items():
-        node_id_counts[mapped_id] = node_id_counts.get(mapped_id, 0) + 1
-    
-    duplicates = {node_id: count for node_id, count in node_id_counts.items() if count > 1}
-    if duplicates:
-        print(f"\nWARNING: Found {len(duplicates)} duplicate node IDs")
-        print("Fixing duplicates...")
-        
-        fixed_mapping = {}
-        id_counter = {}
-        
-        for gmsh_id, mapped_id in node_map.items():
-            if node_id_counts[mapped_id] > 1:
-                if mapped_id not in id_counter:
-                    fixed_mapping[gmsh_id] = mapped_id
-                    id_counter[mapped_id] = 1
-                else:
-                    new_id = max(list(final_nodes.keys()) + 
-                               (list(internal_points.keys()) if internal_points else [])) + id_counter[mapped_id]
-                    fixed_mapping[gmsh_id] = new_id
-                    final_nodes[new_id] = temp_nodes[gmsh_id]
-                    id_counter[mapped_id] += 1
-                    print(f"  Fixed: GMSH node {gmsh_id} → new node {new_id}")
-            else:
-                fixed_mapping[gmsh_id] = mapped_id
-        
-        node_map = fixed_mapping
-        print("Fixed all duplicate node IDs")
-    
-    # Update element nodes
-    for elem in quad4_elems:
-        elem['nodes'] = [node_map[n] for n in elem['nodes']]
-    for elem in tri3_elems:
-        elem['nodes'] = [node_map[n] for n in elem['nodes']]
-    
-    # Step 7: Create visualization
-    fig, ax = plt.subplots(1, 1, figsize=(12, 10))
-    
-    node_coords = np.array([final_nodes[n][:2] for n in final_nodes])
-    bnd_coords = np.array([boundary_nodes[n][:2] for n in boundary_nodes])
-    
-    # Plot mesh elements
-    for elem in quad4_elems:
-        elem_coords = np.array([final_nodes[n][:2] for n in elem['nodes']])
-        ax.fill(elem_coords[:, 0], elem_coords[:, 1], 
-                facecolor='cyan', edgecolor='blue', alpha=0.3, linewidth=1)
-    for elem in tri3_elems:
-        elem_coords = np.array([final_nodes[n][:2] for n in elem['nodes']])
-        ax.fill(elem_coords[:, 0], elem_coords[:, 1], 
-                facecolor='yellow', edgecolor='orange', alpha=0.3, linewidth=1)
-    
-    # Plot boundary nodes
-    ax.scatter(node_coords[:, 0], node_coords[:, 1], c='black', s=30, zorder=5)
-    ax.scatter(bnd_coords[:, 0], bnd_coords[:, 1], c='red', s=100, marker='s', 
-               edgecolors='black', linewidth=2, label='Boundary', zorder=6)
-    
-    # Plot void boundaries
-    if voids:
-        for void_idx, void_nodes in enumerate(voids):
-            void_coords = np.array([void_nodes[n][:2] for n in void_nodes])
-            ax.scatter(void_coords[:, 0], void_coords[:, 1], c='purple', s=100, marker='o',
-                       edgecolors='black', linewidth=2, 
-                       label=f'Void {void_idx + 1}' if void_idx == 0 else '', zorder=6)
-            
-            # Draw void outline
-            void_sorted = sorted(void_nodes.keys())
-            void_outline = np.array([void_nodes[n][:2] for n in void_sorted] + 
-                                   [void_nodes[void_sorted[0]][:2]])
-            ax.plot(void_outline[:, 0], void_outline[:, 1], 'purple', linewidth=2, linestyle='--')
-    
-    # Plot internal points
+    # Match internal points - KEEP ORIGINAL IDs
+    matched_internal = {}
     if internal_points:
-        int_coords = np.array([internal_points[n][:2] for n in internal_points])
-        ax.scatter(int_coords[:, 0], int_coords[:, 1], c='green', s=100, marker='^',
-                   edgecolors='black', linewidth=2, label='Internal', zorder=6)
+        print(f"\nMatching internal points:")
+        for int_id, int_coord in internal_points.items():
+            best = None
+            best_dist = float('inf')
+            for gid, gcoord in temp_nodes.items():
+                if gid in node_map:
+                    continue
+                dist = np.linalg.norm(np.array(gcoord) - np.array(int_coord))
+                if dist < tolerance and dist < best_dist:
+                    best = gid
+                    best_dist = dist
+            
+            if best:
+                node_map[best] = int_id  # USE ORIGINAL ID
+                final_nodes[int_id] = int_coord
+                used_ids.add(int_id)
+                matched_internal[int_id] = int_id
+                print(f"  ✓ {int_id} ← GMSH {best}")
     
-    # Add node numbers
-    for node_id, coord in final_nodes.items():
-        ax.annotate(str(node_id), (coord[0], coord[1]), 
-                   fontsize=node_font_size, ha='center', va='bottom', 
-                   color='darkblue', fontweight='bold',
-                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
-                            edgecolor='none', alpha=0.7))
+    # Sequential numbering for remaining
+    remaining = sorted([g for g in temp_nodes.keys() if g not in node_map])
+    next_id = start_node_id
+    for gid in remaining:
+        while next_id in used_ids:
+            next_id += 1
+        node_map[gid] = next_id
+        final_nodes[next_id] = temp_nodes[gid]
+        used_ids.add(next_id)
+        next_id += 1
     
-    # Add element numbers
+    # Remap elements
+    elem_id = start_element_id
+    final_quad4 = []
+    final_tri3 = []
+    
     for elem in quad4_elems:
-        elem_coords = np.array([final_nodes[n][:2] for n in elem['nodes']])
-        center = elem_coords.mean(axis=0)
-        ax.annotate(str(elem['tag']), center, 
-                   fontsize=element_font_size, ha='center', va='center',
-                   color='darkgreen', style='italic',
-                   bbox=dict(boxstyle='round,pad=0.2', facecolor='cyan', 
-                            edgecolor='none', alpha=0.5))
+        nodes = [node_map[n] for n in elem['nodes']]
+        final_quad4.append({'tag': elem_id, 'nodes': nodes})
+        elem_id += 1
     
     for elem in tri3_elems:
-        elem_coords = np.array([final_nodes[n][:2] for n in elem['nodes']])
-        center = elem_coords.mean(axis=0)
-        ax.annotate(str(elem['tag']), center, 
-                   fontsize=element_font_size, ha='center', va='center',
-                   color='darkorange', style='italic',
-                   bbox=dict(boxstyle='round,pad=0.2', facecolor='yellow', 
-                            edgecolor='none', alpha=0.5))
+        nodes = [node_map[n] for n in elem['nodes']]
+        final_tri3.append({'tag': elem_id, 'nodes': nodes})
+        elem_id += 1
     
-    title = f'Mesh: {len(final_nodes)} nodes, {len(quad4_elems)} quad4, {len(tri3_elems)} tri3'
+    quad4_elems = final_quad4
+    tri3_elems = final_tri3
+    
+    # Verify no duplicates
+    print("\nVerification:")
+    coord_map = {}
+    for nid, coord in final_nodes.items():
+        rc = tuple(round(c, 8) for c in coord)
+        if rc not in coord_map:
+            coord_map[rc] = []
+        coord_map[rc].append(nid)
+    
+    dups = {c: ids for c, ids in coord_map.items() if len(ids) > 1}
+    if dups:
+        print(f"  ✗ {len(dups)} duplicates!")
+    else:
+        print(f"  ✓ No duplicates - {len(final_nodes)} unique nodes")
+    
+    # Visualization
+    fig, ax = plt.subplots(figsize=(14, 12))
+    
+    for elem in quad4_elems:
+        coords = np.array([final_nodes[n][:2] for n in elem['nodes']])
+        ax.fill(coords[:, 0], coords[:, 1], fc='cyan', ec='blue', alpha=0.3, lw=1)
+    for elem in tri3_elems:
+        coords = np.array([final_nodes[n][:2] for n in elem['nodes']])
+        ax.fill(coords[:, 0], coords[:, 1], fc='yellow', ec='orange', alpha=0.3, lw=1)
+    
+    bnd_ids = set(boundary_nodes.keys())
+    void_ids = set()
     if voids:
-        title += f', {len(voids)} voids'
-    ax.set_title(title, fontsize=12, fontweight='bold')
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
+        for v in voids:
+            void_ids.update(v.keys())
+    int_ids = set(matched_internal.keys())
+    reg_ids = set(final_nodes.keys()) - bnd_ids - void_ids - int_ids
+    
+    if reg_ids:
+        coords = np.array([final_nodes[n][:2] for n in reg_ids])
+        ax.scatter(coords[:, 0], coords[:, 1], c='black', s=30, zorder=5)
+    
+    coords = np.array([boundary_nodes[n][:2] for n in boundary_nodes])
+    ax.scatter(coords[:, 0], coords[:, 1], c='red', s=150, marker='s', 
+               ec='black', lw=2, label='Boundary', zorder=6)
+    
+    if voids:
+        for void_nodes in voids:
+            coords = np.array([void_nodes[n][:2] for n in void_nodes])
+            ax.scatter(coords[:, 0], coords[:, 1], c='purple', s=120, marker='o',
+                       ec='black', lw=2, zorder=6)
+    
+    if int_ids:
+        coords = np.array([final_nodes[n][:2] for n in int_ids])
+        ax.scatter(coords[:, 0], coords[:, 1], c='lime', s=300, marker='^',
+                   ec='darkgreen', lw=3, label='Internal', zorder=8)
+    
+    # Annotate internal points
+    if int_ids:
+        for nid in int_ids:
+            coord = final_nodes[nid]
+            ax.annotate(str(nid), (coord[0], coord[1]), xytext=(0, 20),
+                       textcoords='offset points', fontsize=node_font_size+3,
+                       ha='center', color='darkgreen', weight='bold',
+                       bbox=dict(boxstyle='round,pad=0.5', fc='lime', ec='darkgreen', lw=2.5),
+                       arrowprops=dict(arrowstyle='->', lw=1.5, color='darkgreen'),
+                       zorder=11)
+    
+    for nid in bnd_ids:
+        if nid in final_nodes:
+            coord = final_nodes[nid]
+            ax.annotate(str(nid), (coord[0], coord[1]), xytext=(0, -15),
+                       textcoords='offset points', fontsize=node_font_size,
+                       ha='center', color='darkred', weight='bold',
+                       bbox=dict(boxstyle='round,pad=0.3', fc='lightcoral', ec='darkred'),
+                       zorder=9)
+    
+    for nid in reg_ids:
+        coord = final_nodes[nid]
+        ax.annotate(str(nid), (coord[0], coord[1]), fontsize=node_font_size-1,
+                   ha='center', color='darkblue',
+                   bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='none', alpha=0.6),
+                   zorder=7)
+    
+    title = f'{len(final_nodes)} nodes, {len(quad4_elems)} quad4, {len(tri3_elems)} tri3'
+    if int_ids:
+        title += f', {len(int_ids)} internal'
+    ax.set_title(title, fontsize=14, weight='bold')
     ax.legend()
     ax.axis('equal')
     ax.grid(True, alpha=0.3)
-    
     plt.tight_layout()
-    plt.savefig(png_file, dpi=150, bbox_inches='tight')
+    plt.savefig(png_file, dpi=200)
     plt.close()
     
-    print(f"\n{'='*60}")
-    print(f"Mesh generated successfully!")
-    print(f"{'='*60}")
-    print(f"Nodes:          {len(final_nodes)}")
-    print(f"Quad4 elements: {len(quad4_elems)}")
-    print(f"Tri3 elements:  {len(tri3_elems)}")
-    if voids:
-        print(f"Voids:          {len(voids)}")
-    print(f"\nFiles created:")
-    print(f"  - {py_file}")
-    print(f"  - {png_file}")
-    print(f"{'='*60}\n")
+    print(f"\n✓ Complete: {len(final_nodes)} nodes")
+    if matched_internal:
+        print(f"  Internal: {sorted(matched_internal.keys())}")
     
     return {
         'nodes': final_nodes,
         'quad4': quad4_elems,
         'tri3': tri3_elems,
-        'voids': voids if voids else []
+        'voids': voids if voids else [],
+        'internal_points': matched_internal
     }
+
 
 
 def zero_element_boundary_condition(material_props, sections, node_list, boundary_condition, 
@@ -792,15 +407,15 @@ def zero_element_boundary_condition(material_props, sections, node_list, boundar
     }
 
 
-def create_slab(boundary_nodes, mesh_size, internal_points=None, voids=None,
+def create_slab(boundary_nodes, mesh_size, internal_points=None,existing_frame_nodes= None, voids=None,
                 py_file="slab_model.py", png_file="slab_mesh.png",
                 shell_material_config=("ElasticIsotropic", 1, 2e11, 0.3, 7850),
                 shell_section_config=("PlateFiber", 1, 1, 0.01),
-                node_font_size=7, element_font_size=6,
+                node_font_size=14, element_font_size=14,
                 ops_ele_type1="ShellMITC4", ops_ele_type2="ASDShellT3",
                 shell_boundary_conditions=[1, 1, 1, 1, 1, 1],
                 
-                assign_to_ops=True,
+                assign_to_ops=False,
                 use_zero_length=False,
                 zero_length_material_config=None,
                 zero_length_directions=[3],
@@ -825,6 +440,8 @@ def create_slab(boundary_nodes, mesh_size, internal_points=None, voids=None,
         boundary_nodes=boundary_nodes,
         mesh_size=mesh_size,
         internal_points=internal_points,
+        # existing_nodes=existing_frame_nodes,  # ✅ PASS THIS
+
         voids=voids,  
         py_file=py_file,
         png_file=png_file,
@@ -841,7 +458,7 @@ def create_slab(boundary_nodes, mesh_size, internal_points=None, voids=None,
     if assign_to_ops:
         import openseespy.opensees as ops
         
-        ops.wipe()
+        # ops.wipe()
         ops.model("basic", "-ndm", 3, "-ndf", 6)
         
         # Apply shell material and section
@@ -861,8 +478,8 @@ def create_slab(boundary_nodes, mesh_size, internal_points=None, voids=None,
             ops.element(ops_ele_type2, elem['tag'], *elem['nodes'], section_tag)
 
         # Apply surface loads if requested
-        if load_configs is not None and 'pressure' in load_configs:
-            apply_surface_load(mesh=mesh, load_configs=load_configs)
+        # if load_configs is not None and 'pressure' in load_configs:
+        #     apply_surface_load(mesh=mesh, load_configs=load_configs)
 
         # Apply boundary conditions
         if use_zero_length and zero_length_material_config:
@@ -1010,131 +627,6 @@ def create_slab(boundary_nodes, mesh_size, internal_points=None, voids=None,
         # print(f"Python model file created: {py_file}")
     
     return mesh
-
-
-# Example usage
-if __name__ == "__main__":
-    
-    # Define geometry
-    boundary_nodes = {
-        1: (0.0, 0.0, 0.0),
-        2: (2.0, 0.0, 0.0),
-        3: (2.5, 1.5, 0.0),
-        4: (2.0, 3.0, 0.0),
-        5: (0.0, 3.0, 0.0),
-        6: (-0.5, 1.5, 0.0),
-    }
-    
-    internal_points = {
-        100: (1.0, 1.5, 0.0),
-        101: (0.5, 0.75, 0.0),
-    }
-    
-    # Define voids (holes in the mesh)
-    void1 = {
-        20000: (0.5, 0.5, 0.0),
-        20001: (0.5, 1.0, 0.0),
-        20002: (1.0, 1.0, 0.0),
-        20003: (1.0, 0.5, 0.0),
-    }
-    
-    void2 = {
-        30000: (1.5, 1.5, 0.0),
-        30001: (1.5, 2.0, 0.0),
-        30002: (2.0, 2.0, 0.0),
-        30003: (2.0, 1.5, 0.0),
-    }
-    
-    voids = [void1, void2]  # List of voids
-    
-    # Define parameters
-    mesh_size = 0.5
-    load_configs = {
-    'pressure': -1000.0,        # -1000 Pa (downward pressure)
-    'time_series_tag': 1,       # Time series tag
-    'pattern_tag': 1,           # Pattern tag
-    'element_tags': None        # None = all elements, or [1,2,3] for specific elements
-    }
-    # Shell element configs
-    shell_material_config = ("ElasticIsotropic", 1, 2e11, 0.3, 7850)
-    shell_section_config = ("PlateFiber", 1, 1, 0.005)
-    ops_ele_type1 = "ShellMITC4"
-    ops_ele_type2 = "ASDShellT3"
-    shell_boundary_conditions = [1, 1, 1, 1, 1, 1]
-    
-    # Zero-length element configs
-    zero_length_material_config = ("Elastic", 100, 1e8)
-    zero_length_directions = [3]
-    zero_length_boundary_conditions = [1, 1, 1, 1, 1, 1]
-    
-    start_node_id=20000
-    start_element_id=20000
-    
-    # Option 1: Standard boundary with voids
-    print("="*60)
-    print("CREATING MESH WITH VOIDS - STANDARD BOUNDARY")
-    print("="*60)
-    slab = create_slab(
-        boundary_nodes=boundary_nodes,
-        mesh_size=mesh_size,
-        internal_points=internal_points,
-        voids=voids,
-        py_file="slab_with_voids.py",
-        png_file="slab_with_voids.png",
-        shell_material_config=shell_material_config,
-        shell_section_config=shell_section_config,
-        ops_ele_type1=ops_ele_type1,
-        ops_ele_type2=ops_ele_type2,
-        shell_boundary_conditions=shell_boundary_conditions,
-        assign_to_ops=True,
-        use_zero_length=False,
-        load_configs = load_configs,
-        start_node_id=start_node_id,  # ADD
-        start_element_id=start_element_id  # ADD
-    )
-    
-
-    # Option 2: Zero-length boundary with voids
-    print("\n" + "="*60)
-    print("CREATING MESH WITH VOIDS - ZERO-LENGTH BOUNDARY")
-    print("="*60)
-    slab_zero = create_slab(
-        boundary_nodes=boundary_nodes,
-        mesh_size=mesh_size,
-        internal_points=internal_points,
-        voids=voids,
-        py_file="slab_with_voids_zero_length1100.py",
-        png_file="slab_with_voids_zero_length1100.png",
-        shell_material_config=shell_material_config,
-        shell_section_config=shell_section_config,
-        ops_ele_type1=ops_ele_type1,
-        ops_ele_type2=ops_ele_type2,
-        shell_boundary_conditions=shell_boundary_conditions,
-        assign_to_ops=True,
-        use_zero_length=True,
-        zero_length_material_config=zero_length_material_config,
-        zero_length_directions=zero_length_directions,
-        zero_length_boundary_conditions=zero_length_boundary_conditions,
-        element_start_id=10000,
-        spring_node_start_id=1000000,
-        load_configs = load_configs,
-        start_node_id=start_node_id,  # ADD
-        start_element_id=start_element_id  # ADD
-    )
-    
-    print("\n" + "="*60)
-    print("MESH GENERATION COMPLETE")
-    print("="*60)
-
-
-
-
-
-"1st part code end"
-"2nd part code"
-
-
-
 
 
 
@@ -1481,66 +973,671 @@ def create_elements(element_configs):
                     beam['A'], beam['E'], beam['G'], beam['J'], 
                     beam['Iy'], beam['Iz'], beam['transf_tag'])
 
-def calculate_and_apply_masses(element_mass_list, element_configs, node_coords):
-    """Calculate nodal masses from element masses and apply to OpenSees model"""
+from collections import defaultdict
+
+
+"""
+UNIFIED LOAD AND MASS APPLICATION FUNCTION - NO DEFAULTS
+=========================================================
+Single function to handle all loads and masses.
+User MUST provide all parameters explicitly.
+"""
+
+
+"""
+UNIFIED LOAD AND MASS APPLICATION FUNCTION - NO DEFAULTS
+=========================================================
+Single function to handle all loads and masses.
+User MUST provide all parameters explicitly.
+"""
+
+import numpy as np
+import openseespy.opensees as ops
+from collections import defaultdict
+
+def apply_loads_and_masses(
+    load_configs,        # REQUIRED: Load configurations
+    mass_configs,        # REQUIRED: Mass configurations
+    shell_meshes,        # REQUIRED: Shell mesh data
+    slab_configs,        # REQUIRED: Shell configurations
+    element_configs,     # REQUIRED: Element connectivity
+    node_coords          # REQUIRED: Node coordinates
+):
+    """
+    Unified function to apply ALL loads and masses to OpenSees model.
     
-    element_connectivity = {}
+    ALL PARAMETERS ARE REQUIRED - NO DEFAULTS PROVIDED.
     
-    for elem in element_configs.get('force_beam_columns', []):
-        element_connectivity[elem['tag']] = {
-            'node_i': elem['node_i'],
-            'node_j': elem['node_j']
+    Parameters
+    ----------
+    load_configs : dict or None
+        If None: No loads applied
+        If dict: Must contain load definitions:
+        {
+            'time_series': [
+                {'tag': 1, 'type': 'Linear'},
+                {'tag': 2, 'type': 'Constant'},
+            ],
+            
+            'patterns': [
+                {'tag': 1, 'type': 'Plain', 'ts_tag': 1},
+            ],
+            
+            'nodal_loads': [
+                {
+                    'pattern_tag': 1,
+                    'loads': [
+                        {'node': 1, 'forces': [Fx, Fy, Fz, Mx, My, Mz]},
+                    ]
+                }
+            ],
+            
+            'beam_uniform_loads': [
+                {
+                    'pattern_tag': 1,
+                    'loads': [
+                        {'elements': [11, 12], 'wy': 0, 'wz': -10},
+                    ]
+                }
+            ],
+            
+            'beam_point_loads': [
+                {
+                    'pattern_tag': 1,
+                    'loads': [
+                        {'element': 11, 'py': 0, 'pz': -50, 'xl': 0.5},
+                    ]
+                }
+            ],
+            
+            'shell_surface_loads': [
+                {
+                    'pattern_tag': 2,
+                    'loads': [
+                        {'mesh_name': 'Slab_1', 'pressure': -100.0, 'elements': None},
+                    ]
+                }
+            ]
         }
     
-    for elem in element_configs.get('elastic_beam_columns', []):
-        element_connectivity[elem['tag']] = {
-            'node_i': elem['node_i'],
-            'node_j': elem['node_j']
+    mass_configs : dict or None
+        If None: No masses applied
+        If dict: Must contain mass definitions:
+        {
+            'beam_column_mass': [
+                {'tag': 11, 'density': 1.0, 'area': 4.0},
+            ],
+            
+            'nodal_mass': [
+                {'node': 1, 'mass': 100.0},
+            ],
+            
+            'shell_mass': {
+                'calculate': True,
+                'exclude': ['Footing_1'],  # Can be empty list []
+                'scale': 1.0
+            }
         }
     
-    nodal_masses = {node_id: 0.0 for node_id in node_coords.keys()}
+    shell_meshes : list
+        List of shell mesh dictionaries from create_slab()
+        Can be empty list [] if no shells
     
-    for elem_data in element_mass_list:
-        elem_tag = elem_data['tag']
-        elem_mass = elem_data['mass']
+    slab_configs : list
+        List of shell configuration dictionaries
+        Can be empty list [] if no shells
+    
+    element_configs : dict
+        Element connectivity dictionary
+        Must have keys: 'force_beam_columns', 'elastic_beam_columns'
+    
+    node_coords : dict
+        Node coordinates dictionary {node_id: (x, y, z)}
+    
+    Returns
+    -------
+    results : dict
+        {
+            'nodal_masses': dict,
+            'load_summary': dict,
+            'mass_summary': dict
+        }
+    """
+    
+    # Validate required parameters
+    if load_configs is None and mass_configs is None:
+        raise ValueError("Both load_configs and mass_configs are None. Nothing to do!")
+    
+    if element_configs is None:
+        raise ValueError("element_configs is required!")
+    
+    if node_coords is None:
+        raise ValueError("node_coords is required!")
+    
+    # Import opstool if available
+    try:
+        import opstool as opst
+        has_opstool = True
+    except ImportError:
+        print("WARNING: opstool not installed. Some features may not work.")
+        opst = None
+        has_opstool = False
+    
+    results = {
+        'nodal_masses': {},
+        'load_summary': {},
+        'mass_summary': {}
+    }
+    
+    # ========================================================================
+    # PART 1: APPLY LOADS
+    # ========================================================================
+    
+    if load_configs is not None:
+        print("\n" + "="*70)
+        print("APPLYING LOADS")
+        print("="*70)
         
-        if elem_tag not in element_connectivity:
-            continue
+        # ----------------------------------------------------------------
+        # 1.1: CREATE TIME SERIES
+        # ----------------------------------------------------------------
+        if 'time_series' in load_configs:
+            print("\n1. Creating Time Series:")
+            for ts in load_configs['time_series']:
+                tag = ts['tag']
+                ts_type = ts['type']
+                
+                if ts_type == 'Linear':
+                    ops.timeSeries('Linear', tag)
+                elif ts_type == 'Constant':
+                    ops.timeSeries('Constant', tag)
+                elif ts_type == 'Trig':
+                    ops.timeSeries('Trig', tag, ts['tStart'], ts['tEnd'], ts['period'])
+                else:
+                    raise ValueError(f"Unknown time series type: {ts_type}")
+                
+                print(f"  ✓ Time Series {tag}: {ts_type}")
             
-        node_i = element_connectivity[elem_tag]['node_i']
-        node_j = element_connectivity[elem_tag]['node_j']
+            results['load_summary']['time_series'] = len(load_configs['time_series'])
         
-        half_mass = elem_mass / 2.0
-        
-        nodal_masses[node_i] += half_mass
-        nodal_masses[node_j] += half_mass
+        # ----------------------------------------------------------------
+        # 1.2: CREATE LOAD PATTERNS
+        # ----------------------------------------------------------------
+        if 'patterns' in load_configs:
+            print("\n2. Creating Load Patterns:")
+            for pattern in load_configs['patterns']:
+                tag = pattern['tag']
+                pattern_type = pattern['type']
+                ts_tag = pattern['ts_tag']
+                
+                if pattern_type != 'Plain':
+                    raise ValueError(f"Unknown pattern type: {pattern_type}. Only 'Plain' supported.")
+                
+                ops.pattern('Plain', tag, ts_tag)
+                print(f"  ✓ Pattern {tag}: {pattern_type} (TimeSeries {ts_tag})")
             
-    for node_id, total_mass in nodal_masses.items():
-        if total_mass > 0:
-            ops.mass(node_id, total_mass, total_mass, total_mass, 0.0, 0.0, 0.0)
+            results['load_summary']['patterns'] = len(load_configs['patterns'])
+        
+        # ----------------------------------------------------------------
+        # 1.3: APPLY NODAL LOADS
+        # ----------------------------------------------------------------
+        if 'nodal_loads' in load_configs:
+            print("\n3. Applying Nodal Loads:")
+            total_nodal_loads = 0
+            
+            for load_group in load_configs['nodal_loads']:
+                pattern_tag = load_group['pattern_tag']
+                # DON'T create pattern again - it's already created in step 1.2!
+                # Just apply loads to the existing pattern
+                
+                for load in load_group['loads']:
+                    node_id = load['node']
+                    forces = load['forces']
+                    
+                    if len(forces) != 6:
+                        raise ValueError(f"forces must have 6 values [Fx,Fy,Fz,Mx,My,Mz], got {len(forces)}")
+                    
+                    ops.load(node_id, *forces)
+                    total_nodal_loads += 1
+                    print(f"  ✓ Node {node_id}: F={forces[:3]} (Pattern {pattern_tag})")
+            
+            results['load_summary']['nodal_loads'] = total_nodal_loads
+        
+        # ----------------------------------------------------------------
+        # 1.4: APPLY BEAM UNIFORM LOADS
+        # ----------------------------------------------------------------
+        if 'beam_uniform_loads' in load_configs:
+            if not has_opstool:
+                raise ImportError("opstool required for beam_uniform_loads")
+            
+            print("\n4. Applying Beam Uniform Loads:")
+            total_beam_uniform = 0
+            
+            for load_group in load_configs['beam_uniform_loads']:
+                pattern_tag = load_group['pattern_tag']
+                # Pattern already created in step 1.2 - don't create again!
+                
+                for load in load_group['loads']:
+                    elements = load['elements']
+                    wy = load['wy']
+                    wz = load['wz']
+                    
+                    opst.pre.transform_beam_uniform_load(elements, wy=wy, wz=wz)
+                    total_beam_uniform += len(elements)
+                    print(f"  ✓ Elements {elements}: wy={wy}, wz={wz} (Pattern {pattern_tag})")
+            
+            results['load_summary']['beam_uniform_loads'] = total_beam_uniform
+        
+        # ----------------------------------------------------------------
+        # 1.5: APPLY BEAM POINT LOADS
+        # ----------------------------------------------------------------
+        if 'beam_point_loads' in load_configs:
+            if not has_opstool:
+                raise ImportError("opstool required for beam_point_loads")
+            
+            print("\n5. Applying Beam Point Loads:")
+            total_beam_point = 0
+            
+            for load_group in load_configs['beam_point_loads']:
+                pattern_tag = load_group['pattern_tag']
+                # Pattern already created in step 1.2 - don't create again!
+                
+                for load in load_group['loads']:
+                    element = load['element']
+                    py = load['py']
+                    pz = load['pz']
+                    xl = load['xl']
+                    
+                    opst.pre.transform_beam_point_load([element], py=py, pz=pz, xl=xl)
+                    total_beam_point += 1
+                    print(f"  ✓ Element {element}: py={py}, pz={pz}, xl={xl} (Pattern {pattern_tag})")
+            
+            results['load_summary']['beam_point_loads'] = total_beam_point
+        
+        # ----------------------------------------------------------------
+        # 1.6: APPLY SHELL SURFACE LOADS
+        # ----------------------------------------------------------------
+        if 'shell_surface_loads' in load_configs:
+            if not has_opstool:
+                raise ImportError("opstool required for shell_surface_loads")
+            
+            if not shell_meshes:
+                raise ValueError("shell_meshes cannot be empty for shell_surface_loads")
+            
+            print("\n6. Applying Shell Surface Loads:")
+            total_shell_loads = 0
+            
+            for load_group in load_configs['shell_surface_loads']:
+                pattern_tag = load_group['pattern_tag']
+                # Pattern already created in step 1.2 - don't create again!
+                
+                for load in load_group['loads']:
+                    mesh_name = load['mesh_name']
+                    pressure = load['pressure']
+                    specific_elements = load['elements']
+                    
+                    # Find mesh
+                    target_mesh = None
+                    for mesh in shell_meshes:
+                        if mesh.get('config_name') == mesh_name:
+                            target_mesh = mesh
+                            break
+                    
+                    if target_mesh is None:
+                        raise ValueError(f"Mesh '{mesh_name}' not found in shell_meshes")
+                    
+                    # Get element tags
+                    if specific_elements is None:
+                        element_tags = [elem['tag'] for elem in target_mesh['quad4']]
+                        element_tags += [elem['tag'] for elem in target_mesh['tri3']]
+                    else:
+                        element_tags = specific_elements
+                    
+                    # Apply load
+                    opst.pre.transform_surface_uniform_load(ele_tags=element_tags, p=pressure)
+                    total_shell_loads += len(element_tags)
+                    print(f"  ✓ {mesh_name}: pressure={pressure}, {len(element_tags)} elements (Pattern {pattern_tag})")
+            
+            results['load_summary']['shell_surface_loads'] = total_shell_loads
     
-    return nodal_masses
-
-def apply_loads(nodal_loads_list=None, beam_uniform_loads_list=None, 
-                beam_point_loads_list=None, pattern_tag=1, ts_tag=1, ts_type="Linear"):
-    """Apply all types of loads with time series and pattern"""
-    ops.timeSeries(ts_type, ts_tag)
-    ops.pattern("Plain", pattern_tag, ts_tag)
+    # ========================================================================
+    # PART 2: APPLY MASSES
+    # ========================================================================
     
-    if nodal_loads_list is not None:
-        for node_id, fx, fy, fz, mx, my, mz in nodal_loads_list:
-            ops.load(node_id, fx, fy, fz, mx, my, mz)
+    # ========================================================================
+    # PART 2: APPLY MASSES
+    # ========================================================================
     
-    if beam_uniform_loads_list is not None:
-        for element_id, wy, wz in beam_uniform_loads_list:
-            opst.pre.transform_beam_uniform_load([element_id], wy=wy, wz=wz)
+    if mass_configs is not None:
+        print("\n" + "="*70)
+        print("APPLYING MASSES")
+        print("="*70)
+        
+        # ================================================================
+        # INITIALIZE NODAL MASS DICTIONARY WITH ALL NODES
+        # ================================================================
+        # Start with frame nodes from node_coords
+        nodal_masses = {node_id: 0.0 for node_id in node_coords.keys()}
+        
+        # Add all shell mesh nodes
+        if shell_meshes:
+            for shell_mesh in shell_meshes:
+                for node_id in shell_mesh['nodes'].keys():
+                    if node_id not in nodal_masses:
+                        nodal_masses[node_id] = 0.0
+        
+        print(f"\nInitialized mass dictionary with {len(nodal_masses)} nodes")
+        
+        # ----------------------------------------------------------------
+        # 2.1: BEAM/COLUMN MASS
+        # ----------------------------------------------------------------
+        if 'beam_column_mass' in mass_configs:
+            print("\n1. Calculating Beam/Column Masses:")
+            
+            beam_col_mass_applied = 0
+            
+            for item in mass_configs['beam_column_mass']:
+                tag = item['tag']
+                density = item['density']
+                area = item['area']
+                
+                # Find element in force beam columns
+                element_found = False
+                node_i, node_j = None, None
+                
+                for col in element_configs['force_beam_columns']:
+                    if col['tag'] == tag:
+                        node_i, node_j = col['node_i'], col['node_j']
+                        element_found = True
+                        break
+                
+                # If not found, search in elastic beam columns
+                if not element_found:
+                    for beam in element_configs['elastic_beam_columns']:
+                        if beam['tag'] == tag:
+                            node_i, node_j = beam['node_i'], beam['node_j']
+                            element_found = True
+                            break
+                
+                if not element_found:
+                    raise ValueError(f"Element {tag} not found in element_configs")
+                
+                # Calculate element length
+                xi, yi, zi = node_coords[node_i]
+                xj, yj, zj = node_coords[node_j]
+                length = ((xj-xi)**2 + (yj-yi)**2 + (zj-zi)**2)**0.5
+                
+                # Calculate element mass
+                mass = density * area * length
+                half_mass = mass / 2.0
+                
+                # Ensure nodes exist in dictionary (safety check)
+                if node_i not in nodal_masses:
+                    nodal_masses[node_i] = 0.0
+                if node_j not in nodal_masses:
+                    nodal_masses[node_j] = 0.0
+                
+                # Add mass to nodes
+                nodal_masses[node_i] += half_mass
+                nodal_masses[node_j] += half_mass
+                
+                beam_col_mass_applied += mass
+            
+            print(f"  ✓ Processed {len(mass_configs['beam_column_mass'])} beam/column elements")
+            print(f"  ✓ Total beam/column mass: {beam_col_mass_applied:.2f}")
+            results['mass_summary']['beam_column_count'] = len(mass_configs['beam_column_mass'])
+            results['mass_summary']['beam_column_mass'] = beam_col_mass_applied
+        
+        # ----------------------------------------------------------------
+        # 2.2: NODAL MASS (with automatic summation at common nodes)
+        # ----------------------------------------------------------------
+        if 'nodal_mass' in mass_configs:
+            print("\n2. Applying Nodal Masses:")
+            
+            # Group by node to show summation
+            node_mass_groups = defaultdict(list)
+            for item in mass_configs['nodal_mass']:
+                node_id = item['node']
+                mass_value = item['mass']
+                node_mass_groups[node_id].append(mass_value)
+            
+            total_nodal_mass_applied = 0.0
+            
+            for node_id, mass_list in node_mass_groups.items():
+                total_mass = sum(mass_list)
+                
+                # Ensure node exists in dictionary (safety check)
+                if node_id not in nodal_masses:
+                    nodal_masses[node_id] = 0.0
+                
+                # Add mass to node
+                nodal_masses[node_id] += total_mass
+                total_nodal_mass_applied += total_mass
+                
+                # Show summation if multiple entries for same node
+                if len(mass_list) > 1:
+                    mass_str = ' + '.join([f'{m:.2f}' for m in mass_list])
+                    print(f"  ✓ Node {node_id}: {mass_str} = {total_mass:.2f} (summed)")
+                else:
+                    print(f"  ✓ Node {node_id}: {total_mass:.2f}")
+            
+            print(f"  ✓ Total nodal mass: {total_nodal_mass_applied:.2f}")
+            results['mass_summary']['nodal_mass_count'] = len(mass_configs['nodal_mass'])
+            results['mass_summary']['nodal_mass_total'] = total_nodal_mass_applied
+        
+        # ----------------------------------------------------------------
+        # 2.3: SHELL MASS (calculated from element areas)
+        # ----------------------------------------------------------------
+        if 'shell_mass' in mass_configs:
+            shell_config = mass_configs['shell_mass']
+            
+            if shell_config['calculate']:
+                if not has_opstool:
+                    raise ImportError("opstool required for shell mass calculation")
+                
+                if not shell_meshes:
+                    raise ValueError("shell_meshes cannot be empty when calculate=True")
+                
+                if not slab_configs:
+                    raise ValueError("slab_configs cannot be empty when calculate=True")
+                
+                print("\n3. Calculating Shell Masses:")
+                
+                exclude_list = shell_config['exclude']
+                scale_factor = shell_config['scale']
+                
+                total_shell_elements = 0
+                total_shell_mass_applied = 0.0
+                
+                for shell_mesh in shell_meshes:
+                    config_name = shell_mesh.get('config_name', 'Unknown')
+                    
+                    # Check if excluded
+                    if config_name in exclude_list:
+                        print(f"  ⊘ {config_name}: EXCLUDED from mass calculation")
+                        continue
+                    
+                    # Find density and thickness from slab_configs
+                    density = None
+                    thickness = None
+                    
+                    for cfg in slab_configs:
+                        if cfg.get('name') == config_name:
+                            mat_config = cfg['shell_material_config']
+                            density = mat_config[4] * scale_factor
+                            
+                            sec_config = cfg['shell_section_config']
+                            thickness = sec_config[3]
+                            break
+                    
+                    if density is None or thickness is None:
+                        raise ValueError(f"Could not find density/thickness for {config_name}")
+                    
+                    # Get all shell element tags
+                    shell_ele_tags = [elem['tag'] for elem in shell_mesh['quad4'] + shell_mesh['tri3']]
+                    
+                    # Calculate masses from element areas
+                    shell_nodal_masses = _calculate_shell_mass_from_areas(
+                        ele_tags=shell_ele_tags,
+                        density=density,
+                        thickness=thickness,
+                        opst=opst
+                    )
+                    
+                    # Add to total nodal masses (with safety check)
+                    mesh_total_mass = 0.0
+                    for node_id, shell_mass in shell_nodal_masses.items():
+                        if node_id not in nodal_masses:
+                            nodal_masses[node_id] = 0.0
+                        
+                        nodal_masses[node_id] += shell_mass
+                        mesh_total_mass += shell_mass
+                    
+                    total_shell_elements += len(shell_ele_tags)
+                    total_shell_mass_applied += mesh_total_mass
+                    
+                    print(f"  ✓ {config_name}: {len(shell_ele_tags)} elements, mass={mesh_total_mass:.2f}")
+                
+                print(f"  ✓ Total shell mass: {total_shell_mass_applied:.2f}")
+                results['mass_summary']['shell_elements'] = total_shell_elements
+                results['mass_summary']['shell_mass_total'] = total_shell_mass_applied
+        
+        # ----------------------------------------------------------------
+        # 2.4: APPLY MASSES TO OPENSEES MODEL
+        # ----------------------------------------------------------------
+        print("\n4. Applying Masses to OpenSees Model:")
+        
+        nodes_with_mass = 0
+        total_mass_applied = 0.0
+        
+        for node_id, mass_value in nodal_masses.items():
+            if mass_value > 0:
+                # Apply mass to translational DOFs (X, Y, Z)
+                # Rotational inertias set to 0
+                ops.mass(node_id, mass_value, mass_value, mass_value, 0.0, 0.0, 0.0)
+                nodes_with_mass += 1
+                total_mass_applied += mass_value
+        
+        print(f"  ✓ Applied mass to {nodes_with_mass} nodes")
+        print(f"  ✓ Total mass in model: {total_mass_applied:.4f}")
+        
+        # Store results
+        results['nodal_masses'] = nodal_masses
+        results['mass_summary']['nodes_with_mass'] = nodes_with_mass
+        results['mass_summary']['total_mass'] = total_mass_applied
+        
+    # ========================================================================
+    # SUMMARY
+    # ========================================================================
     
-    if beam_point_loads_list is not None:
-        for element_id, py, pz, xl in beam_point_loads_list:
-            opst.pre.transform_beam_point_load([element_id], py=py, pz=pz, xl=xl)
+    print("\n" + "="*70)
+    print("LOAD AND MASS APPLICATION COMPLETE")
+    print("="*70)
+    
+    if load_configs:
+        print("\nLoads Applied:")
+        for key, value in results['load_summary'].items():
+            print(f"  - {key}: {value}")
+    
+    if mass_configs:
+        print("\nMasses Applied:")
+        for key, value in results['mass_summary'].items():
+            print(f"  - {key}: {value}")
+    
+    print("="*70)
+    
+    return results
 
 
 
+def _compute_tri_area_and_normal(vertices):
+    """
+    Compute the area and normal vector of a triangular element.
+
+    Parameters
+    ----------
+    vertices : numpy.ndarray
+        Coordinates of the triangle's vertices, shape (3, 3).
+
+    Returns
+    -------
+    area : float
+        Area of the triangle.
+    normal : numpy.ndarray
+        Unit normal vector of the triangle, shape (3,).
+    """
+    # Edges: IJ and JK
+    edge_ij = vertices[1] - vertices[0]
+    edge_jk = vertices[2] - vertices[1]
+
+    # Compute cross product
+    cross_product = np.cross(edge_ij, edge_jk)
+    norm = np.linalg.norm(cross_product)
+    area = 0.5 * norm
+    # Normalize the normal vector
+    normal = cross_product / norm
+    return area, normal
+
+
+def _compute_quad_area_and_normal(vertices):
+    """
+    Compute the area and normal vector of a quadrilateral element.
+
+    Parameters
+    ----------
+    vertices : numpy.ndarray
+        Coordinates of the quadrilateral's vertices, shape (4, 3).
+
+    Returns
+    -------
+    area : float
+        Area of the quadrilateral.
+    normal : numpy.ndarray
+        Unit normal vector of the quadrilateral, shape (3,).
+    """
+    # Divide quadrilateral into two triangles
+    triangle1 = vertices[:3]
+    triangle2 = np.array([vertices[0], vertices[2], vertices[3]])
+
+    # Compute areas and normals
+    area1, normal1 = _compute_tri_area_and_normal(triangle1)
+    area2, normal2 = _compute_tri_area_and_normal(triangle2)
+
+    # Average the normals and normalize
+    normal = (normal1 + normal2) / 2.0
+    # normal = normal / np.linalg.norm(normal)
+    return area1 + area2, normal
+
+# ============================================================================
+# HELPER FUNCTION: Shell Mass Calculation
+# ============================================================================
+
+def _calculate_shell_mass_from_areas(ele_tags, density, thickness, opst):
+    """Calculate shell element mass from areas (internal helper function)"""
+    
+    ele_tags = [int(tag) for tag in ele_tags]
+    nodal_masses = defaultdict(float)
+    
+    for etag in ele_tags:
+        node_ids = ops.eleNodes(etag)
+        vertices = np.array([ops.nodeCoord(node_id) for node_id in node_ids])
+        
+        # Calculate area
+        if len(node_ids) == 3:
+            area, _ = _compute_tri_area_and_normal(vertices)
+        elif len(node_ids) == 4:
+            area, _ = _compute_quad_area_and_normal(vertices)
+        else:
+            raise ValueError(f"Unsupported element with {len(node_ids)} nodes")
+        
+        # Calculate and distribute mass
+        element_mass = density * area * thickness
+        mass_per_node = element_mass / len(node_ids)
+        
+        for node_id in node_ids:
+            nodal_masses[node_id] += mass_per_node
+    
+    return dict(nodal_masses)
 
 def build_model(
     model_params,
@@ -1558,11 +1655,19 @@ def build_model(
     diaphragm_list=None,
     start_node_id=20000,  # ADD
     start_element_id=20000,  # ADD
+    # element_mass_list=None,
+    # nodal_mass_applied=None,
+    # load_configs=None,      # NEW: Unified load config
+    # mass_configs=None,      # NEW: Unified mass config (or keep old params)
+    load_configs=None,      # NEW: Unified load config
+    mass_configs=None,      # NEW: Unified mass config
+
     visualize=True,
     output_dir="output",
     
     # NEW: Single parameter for all create_slab() configurations
-    slab_configs=None  # List of dicts with create_slab() parameters (for slabs, footings, etc.)
+    slab_configs=None,  # List of dicts with create_slab() parameters (for slabs, footings, etc.)
+    existing_frame_nodes=None
 ): 
     """
     Build complete OpenSeesPy 3D frame model with integrated fiber section creation,
@@ -1645,6 +1750,7 @@ def build_model(
                 boundary_nodes=config['boundary_nodes'],
                 mesh_size=config.get('mesh_size', 1.0),
                 internal_points=config.get('internal_points', None),
+                existing_frame_nodes=existing_frame_nodes,
                 voids=config.get('voids', None),
                 py_file=os.path.join(output_dir, config.get('py_file', f'shell{i}_model.py')),
                 png_file=os.path.join(output_dir, config.get('png_file', f'shell{i}_mesh.png')),
@@ -1656,7 +1762,7 @@ def build_model(
                 ops_ele_type1=config.get('ops_ele_type1', "ShellMITC4"),
                 ops_ele_type2=config.get('ops_ele_type2', "ASDShellT3"),
                 shell_boundary_conditions=config.get('shell_boundary_conditions', [0, 0, 0, 0, 0, 0]),
-                assign_to_ops=False,
+                # assign_to_ops=True,
                 use_zero_length=config.get('use_zero_length', False),
                 zero_length_material_config=config.get('zero_length_material_config', None),
                 zero_length_directions=config.get('zero_length_directions', [3]),
@@ -1816,48 +1922,7 @@ def build_model(
     
     print(f"✓ Created {col_count} columns and {beam_count} beams")
     
-    # ===================================================================
-    # STEP 10: CREATE SHELL ELEMENTS
-    # ===================================================================
-    
-    print("\n" + "="*80)
-    # print("STEP 10: CREATING SHELL ELEMENTS")
-    # print("="*80)
-    
-    # shell_ele_count = 0
-    # if shell_results:
-    #     for shell_mesh in shell_results:
-    #         config_name = shell_mesh.get('config_name', 'Unknown')
-            
-    #         # Get section tag from shell_section_config
-    #         sec_tag = shell_mesh['shell_section_config'][1]
-            
-    #         # Define nDMaterial and section if not already defined
-    #         try:
-    #             mat_config = shell_mesh['shell_material_config']
-    #             ops.nDMaterial(mat_config[0], mat_config[1], mat_config[2], mat_config[3], mat_config[4])
-    #         except:
-    #             pass  # Material might already exist
-            
-    #         try:
-    #             sec_config = shell_mesh['shell_section_config']
-    #             ops.section(sec_config[0], sec_config[1], sec_config[2], sec_config[3])
-    #         except:
-    #             pass  # Section might already exist
-            
-    #         # Create quad4 elements
-    #         for elem in shell_mesh['quad4']:
-    #             ops.element("ShellMITC4", elem['tag'], *elem['nodes'], sec_tag)
-    #             shell_ele_count += 1
-            
-    #         # Create tri3 elements
-    #         for elem in shell_mesh['tri3']:
-    #             ops.element("ASDShellT3", elem['tag'], *elem['nodes'], sec_tag)
-    #             shell_ele_count += 1
-            
-    #         print(f"  {config_name}: {len(shell_mesh['quad4']) + len(shell_mesh['tri3'])} elements")
-    
-    # print(f"✓ Created {shell_ele_count} total shell elements")
+
     
 
     # ===================================================================
@@ -1918,13 +1983,62 @@ def build_model(
 
     print(f"✓ Created {shell_ele_count} total shell elements")
 
+
     # ===================================================================
-    # STEP 11: VISUALIZATION
+    # # STEP 11: CREATE ELEMENT MASS
+    # # ===================================================================
+    
+    # print("\n" + "="*80)
+    # print("STEP 11: CALCULATING AND APPLYING MASSES")
+    # print("="*80)
+    
+    # if element_mass_list:
+    #     nodal_masses= calculate_and_apply_all_masses(
+    #         element_mass_list=element_mass_list,
+    #         shell_meshes=shell_results,
+    #         slab_configs=slab_configs,
+    #         element_configs=element_configs,
+    #         node_coords=node_coords,
+    #         nodal_mass_applied=nodal_mass_applied  # NEW!
+    #     )
+    # else:
+    #     print("No beam/column masses defined")
+
+    # ===================================================================
+    # STEP 11: APPLY LOADS AND MASSES
+    # ===================================================================
+    
+    print("\n" + "="*80)
+    print("STEP 11: APPLYING LOADS AND MASSES")
+    print("="*80)
+    
+    # Prepare load configs (if any)
+    load_configs_to_apply = load_configs if load_configs else None
+    
+    # Prepare mass configs (if any) - SIMPLIFY THIS
+    mass_configs_to_apply = mass_configs if mass_configs else None
+
+    
+    # Apply loads and masses using unified function
+    if load_configs_to_apply or mass_configs_to_apply:
+        results = apply_loads_and_masses(
+            load_configs=load_configs_to_apply,
+            mass_configs=mass_configs_to_apply,
+            shell_meshes=shell_results,
+            slab_configs=slab_configs,
+            element_configs=element_configs,
+            node_coords=node_coords
+        )
+    else:
+        print("No loads or masses defined")
+    
+    # ===================================================================
+    # STEP 12: VISUALIZATION
     # ===================================================================
     
     if visualize:
         print("\n" + "="*80)
-        print("STEP 11: CREATING VISUALIZATION")
+        print("STEP 12: CREATING VISUALIZATION")
         print("="*80)
         
         try:
@@ -1946,7 +2060,7 @@ def build_model(
             print(f"Visualization error: {e}")
     
     # ===================================================================
-    # STEP 12: SUMMARY
+    # STEP 13: SUMMARY
     # ===================================================================
     
     print("\n" + "="*80)
@@ -1974,755 +2088,507 @@ def build_model(
         'total_elements': len(all_ele_tags)
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ===========================================================================================
-# MATERIAL AND SECTION DEFINITIONS
-# ===========================================================================================
-
-# 1. CONCRETE MATERIALS FOR FIBER SECTION
-concrete_materials = {
-    'concrete_cover': {
-        'elastic_modulus': 3600.0,  # ksi
-        'poissons_ratio': 0.2,
-        'density': 0.150,  # kcf
-        'yield_strength': 4.0,  # ksi
-        'color': '#dbb40c'  # gold/yellow
-    },
-    'concrete_core': {
-        'elastic_modulus': 3600.0,  # ksi
-        'poissons_ratio': 0.2,
-        'density': 0.150,  # kcf
-        'yield_strength': 5.0,  # ksi
-        'color': '#88b378'  # green
-    },
-    'steel_rebar': {
-        'elastic_modulus': 29000.0,  # ksi
-        'poissons_ratio': 0.3,
-        'density': 0.490,  # kcf
-        'yield_strength': 60.0,  # ksi
-        'color': 'black'
-    }
-}
-
-# ===========================================================================================
-# SECTION 1: RECTANGULAR COLUMN 2ft x 2ft WITH 4 REBARS (for columns A1, B1, A2)
-# ===========================================================================================
-
-column_rect_2x2_outline = [[-12.0, -12.0], [12.0, -12.0], [12.0, 12.0], [-12.0, 12.0]]
-column_rect_2x2_cover = 1.5  # inches
-
-column_rect_2x2_rebar = [{
-    'type': 'points',
-    'points': [
-        [-10.5, -10.5],  # Bottom-left corner
-        [10.5, -10.5],   # Bottom-right corner
-        [10.5, 10.5],    # Top-right corner
-        [-10.5, 10.5]    # Top-left corner
-    ],
-    'dia': 1.0,  # inches (#8 bar)
-    'color': 'red',
-    'group_name': 'Corner_Rebars'
-}]
-
-column_rect_2x2_mat_tags = {
-    'cover': 1,
-    'core': 2,
-    'rebar': 3
-}
-
-# ===========================================================================================
-# SECTION 2: RECTANGULAR COLUMN 2ft x 3ft WITH 6 REBARS (for columns C1, B2)
-# ===========================================================================================
-
-column_rect_2x3_outline = [[-12.0, -18.0], [12.0, -18.0], [12.0, 18.0], [-12.0, 18.0]]
-column_rect_2x3_cover = 1.5  # inches
-
-column_rect_2x3_rebar = [{
-    'type': 'points',
-    'points': [
-        [-10.5, -16.5],  # Bottom-left
-        [10.5, -16.5],   # Bottom-right
-        [-10.5, 0.0],    # Middle-left
-        [10.5, 0.0],     # Middle-right
-        [-10.5, 16.5],   # Top-left
-        [10.5, 16.5]     # Top-right
-    ],
-    'dia': 1.0,  # inches (#8 bar)
-    'color': 'red',
-    'group_name': 'Edge_Rebars'
-}]
-
-column_rect_2x3_mat_tags = {
-    'cover': 4,
-    'core': 5,
-    'rebar': 6
-}
-
-# ===========================================================================================
-# SECTION 3: CIRCULAR COLUMN (2ft diameter) WITH 8 REBARS (for columns A2, C2)
-# ===========================================================================================
-
-import opstool as opst
-import numpy as np
-
-column_circular_outline = opst.pre.section.create_circle_points(
-    xo=[0.0, 0.0],
-    radius=12.0,
-    angles=(0, 360),
-    n_sub=64
-)
-
-column_circular_cover = 1.5  # inches
-
-column_circular_rebar = [{
-    'type': 'circle',
-    'xo': [0.0, 0.0],
-    'radius': 10.5,
-    'dia': 1.0,
-    'n': 8,
-    'angles': (0, 360),
-    'color': 'red',
-    'group_name': 'Circular_Rebars'
-}]
-
-column_circular_mat_tags = {
-    'cover': 7,
-    'core': 8,
-    'rebar': 9
-}
-
-# ===========================================================================================
-# SHEAR MODULUS AND UNIAXIAL MATERIALS
-# ===========================================================================================
-
-G_concrete = 1500.0  # ksi
-
-material_params = [
-    # Section 1: Rect 2x2 (4 bars)
-    ['Concrete01', 1, -4.0, -0.002, -0.8, -0.006],   # Cover
-    ['Concrete01', 2, -5.0, -0.002, -1.0, -0.006],   # Core
-    ['Steel01', 3, 60.0, 29000.0, 0.01],             # Rebar
+def generate_complete_model_file(
+    output_filepath,
+    model_params,
+    fiber_section_info,
+    material_params,
+    node_coords,
+    shell_meshes,
+    slab_configs,
+    boundary_conditions,
+    element_configs,
+    nodal_spring_configs,
+    load_configs,
+    mass_configs
+):
+    """
+    Generate a complete standalone OpenSeesPy model file (.py)
     
-    # Section 2: Rect 2x3 (6 bars)
-    ['Concrete01', 4, -4.0, -0.002, -0.8, -0.006],   # Cover
-    ['Concrete01', 5, -5.0, -0.002, -1.0, -0.006],   # Core
-    ['Steel01', 6, 60.0, 29000.0, 0.01],             # Rebar
+    Parameters
+    ----------
+    output_filepath : str
+        Path to output .py file (e.g., 'final_model.py')
     
-    # Section 3: Circular (8 bars)
-    ['Concrete01', 7, -4.0, -0.002, -0.8, -0.006],   # Cover
-    ['Concrete01', 8, -5.0, -0.002, -1.0, -0.006],   # Core
-    ['Steel01', 9, 60.0, 29000.0, 0.01]              # Rebar
-]
-
-# ===========================================================================================
-# NODE COORDINATES
-# ===========================================================================================
-
-node_coords_dict = {
-    # Base nodes (z = 0 ft)
-    1: (0.0, 0.0, 0.0),      # Column A1 base
-    2: (20.0, 0.0, 0.0),     # Column B1 base
-    3: (40.0, 0.0, 0.0),     # Column C1 base
-    4: (0.0, 20.0, 0.0),     # Column A2 base
-    5: (20.0, 20.0, 0.0),    # Column B2 base
-    6: (40.0, 20.0, 0.0),    # Column C2 base
+    model_params : dict
+        {'ndm': 3, 'ndf': 6}
     
-    # Top nodes (z = 10 ft)
-    11: (0.0, 0.0, 10.0),    # Column A1 top
-    12: (20.0, 0.0, 10.0),   # Column B1 top
-    13: (40.0, 0.0, 10.0),   # Column C1 top
-    14: (0.0, 20.0, 10.0),   # Column A2 top
-    15: (20.0, 20.0, 10.0),  # Column B2 top
-    16: (40.0, 20.0, 10.0)   # Column C2 top
-}
-
-# ===========================================================================================
-# BOUNDARY CONDITIONS
-# ===========================================================================================
-
-boundary_conditions_dict = {
-    # Fix all DOFs for base nodes (1-6)
-    1: [1, 1, 1, 1, 1, 1],
-    2: [1, 1, 1, 1, 1, 1],
-    3: [1, 1, 1, 1, 1, 1],
-    4: [1, 1, 1, 1, 1, 1],
-    5: [1, 1, 1, 1, 1, 1],
-    6: [1, 1, 1, 1, 1, 1],
+    fiber_section_info : list
+        List of fiber section dictionaries with 'txt_path' for commands
     
-    # Top nodes (11-16) are free (for slab connection)
-    11: [0, 0, 0, 0, 0, 0],
-    12: [0, 0, 0, 0, 0, 0],
-    13: [0, 0, 0, 0, 0, 0],
-    14: [0, 0, 0, 0, 0, 0],
-    15: [0, 0, 0, 0, 0, 0],
-    16: [0, 0, 0, 0, 0, 0]
-}
-
-# ===========================================================================================
-# ELEMENT CONFIGURATIONS
-# ===========================================================================================
-
-element_configs_dict = {
-    'transformations': [
-        {
-            'type': 'Linear',
-            'tag': 1,
-            'vecxz': [1, 0, 0]  # For columns
-        },
-        {
-            'type': 'Linear',
-            'tag': 2,
-            'vecxz': [0, 0, 1]  # For beams
-        }
-    ],
+    material_params : list
+        List of uniaxial material parameters
     
-    'integrations': [
-        # Integration for Section 1 (2x2 rect)
-        {
-            'type': 'Lobatto',
-            'tag': 1,
-            'sec_tag': 1,
-            'np': 5
-        },
-        # Integration for Section 2 (2x3 rect)
-        {
-            'type': 'Lobatto',
-            'tag': 2,
-            'sec_tag': 2,
-            'np': 5
-        },
-        # Integration for Section 3 (circular)
-        {
-            'type': 'Lobatto',
-            'tag': 3,
-            'sec_tag': 3,
-            'np': 5
-        }
-    ],
+    node_coords : dict
+        Frame node coordinates {node_id: (x, y, z)}
     
-    'fiber_sections': [],  # Will be populated by build_model function
+    shell_meshes : list
+        List of shell mesh dictionaries from create_slab()
     
-    'force_beam_columns': [
-        # SECTION ASSIGNMENT:
-        # A1, B1: Section 1 (2x2 rect, 4 bars) - integ_tag = 1
-        # C1, B2: Section 2 (2x3 rect, 6 bars) - integ_tag = 2
-        # A2, C2: Section 3 (circular, 8 bars) - integ_tag = 3
+    slab_configs : list
+        List of shell configuration dictionaries
+    
+    boundary_conditions : dict
+        Boundary conditions {node_id: [dof1, dof2, ...]}
+    
+    element_configs : dict
+        Element connectivity and properties
+    
+    nodal_spring_configs : dict or None
+        Zero-length spring configurations
+    
+    load_configs : dict or None
+        Load configurations
+    
+    mass_configs : dict or None
+        Mass configurations
+    """
+    
+    with open(output_filepath, 'w') as f:
         
-        {'tag': 1, 'node_i': 1, 'node_j': 11, 'transf_tag': 1, 'integ_tag': 1},  # A1: Rect 2x2
-        {'tag': 2, 'node_i': 2, 'node_j': 12, 'transf_tag': 1, 'integ_tag': 1},  # B1: Rect 2x2
-        {'tag': 3, 'node_i': 3, 'node_j': 13, 'transf_tag': 1, 'integ_tag': 2},  # C1: Rect 2x3
-        {'tag': 4, 'node_i': 4, 'node_j': 14, 'transf_tag': 1, 'integ_tag': 3},  # A2: Circular
-        {'tag': 5, 'node_i': 5, 'node_j': 15, 'transf_tag': 1, 'integ_tag': 2},  # B2: Rect 2x3
-        {'tag': 6, 'node_i': 6, 'node_j': 16, 'transf_tag': 1, 'integ_tag': 3}   # C2: Circular
-    ],
-    
-    'elastic_sections': [
-        {
-            'sec_tag': 100,
-            'E': 3600.0,
-            'A': 576.0,
-            'Iz': 27648.0,
-            'Iy': 27648.0,
-            'G': 1500.0,
-            'J': 44236.8
-        }
-    ],
-    
-    'elastic_beam_columns': [
-        # Beams in X-direction
-        {'tag': 11, 'node_i': 11, 'node_j': 12, 'A': 576.0, 'E': 3600.0, 'G': 1500.0, 
-         'J': 44236.8, 'Iy': 27648.0, 'Iz': 27648.0, 'transf_tag': 2},
-        {'tag': 12, 'node_i': 12, 'node_j': 13, 'A': 576.0, 'E': 3600.0, 'G': 1500.0, 
-         'J': 44236.8, 'Iy': 27648.0, 'Iz': 27648.0, 'transf_tag': 2},
-        {'tag': 13, 'node_i': 14, 'node_j': 15, 'A': 576.0, 'E': 3600.0, 'G': 1500.0, 
-         'J': 44236.8, 'Iy': 27648.0, 'Iz': 27648.0, 'transf_tag': 2},
-        {'tag': 14, 'node_i': 15, 'node_j': 16, 'A': 576.0, 'E': 3600.0, 'G': 1500.0, 
-         'J': 44236.8, 'Iy': 27648.0, 'Iz': 27648.0, 'transf_tag': 2},
+        # ================================================================
+        # HEADER
+        # ================================================================
+        f.write("# " + "="*70 + "\n")
+        f.write("# COMPLETE OPENSEESPY MODEL - AUTO-GENERATED\n")
+        f.write("# " + "="*70 + "\n")
+        f.write("# This file contains the complete structural model including:\n")
+        f.write("# - Fiber section columns\n")
+        f.write("# - Elastic beam elements\n")
+        f.write("# - Shell elements (slabs, footings, etc.)\n")
+        f.write("# - Boundary conditions\n")
+        f.write("# - Zero-length springs (if applicable)\n")
+        f.write("# - Loads and masses\n")
+        f.write("# " + "="*70 + "\n\n")
         
-        # Beams in Y-direction
-        {'tag': 15, 'node_i': 11, 'node_j': 14, 'A': 576.0, 'E': 3600.0, 'G': 1500.0, 
-         'J': 44236.8, 'Iy': 27648.0, 'Iz': 27648.0, 'transf_tag': 2},
-        {'tag': 16, 'node_i': 13, 'node_j': 16, 'A': 576.0, 'E': 3600.0, 'G': 1500.0, 
-         'J': 44236.8, 'Iy': 27648.0, 'Iz': 27648.0, 'transf_tag': 2},
+        f.write("import openseespy.opensees as ops\n")
+        f.write("import opstool as opst\n")
+        f.write("import numpy as np\n\n")
         
-        # Diagonal beam
-        {'tag': 17, 'node_i': 12, 'node_j': 15, 'A': 576.0, 'E': 3600.0, 'G': 1500.0, 
-         'J': 44236.8, 'Iy': 27648.0, 'Iz': 27648.0, 'transf_tag': 2}
-    ]
-}
-
-# ===========================================================================================
-# MODEL PARAMETERS
-# ===========================================================================================
-
-model_params = {
-    'ndm': 3,
-    'ndf': 6
-}
-
-# ===========================================================================================
-# SPRING CONFIGURATIONS
-# ===========================================================================================
-
-K = 1e8  # Spring stiffness
-
-spring_configs = [
-    {
-        'node_i': 1,
-        'mat_tag': 101,
-        'dirs': [3],
-        'spring_type': 'ENT',
-        'stiffness': K
-    },
-    {
-        'node_i': 2,
-        'mat_tag': 102,
-        'dirs': [3],
-        'spring_type': 'ENT',
-        'stiffness': K
-    },
-    {
-        'node_i': 3,
-        'mat_tag': 103,
-        'dirs': [3],
-        'spring_type': 'ENT',
-        'stiffness': K
-    },
-    {
-        'node_i': 4,
-        'mat_tag': 104,
-        'dirs': [3],
-        'spring_type': 'ENT',
-        'stiffness': K
-    },
-    {
-        'node_i': 5,
-        'mat_tag': 105,
-        'dirs': [3],
-        'spring_type': 'ENT',
-        'stiffness': K
-    },
-    {
-        'node_i': 6,
-        'mat_tag': 106,
-        'dirs': [3],
-        'spring_type': 'ENT',
-        'stiffness': K
-    }
-]
-
-# # User defines nodal_spring_configs
-# nodal_spring_configs = {
-#     'material_props': {
-#         'id': 101,
-#         'directions': [3],
-#         'config': ['ENT', 101, 1e8]
-#     },
-#     'sections': {},  # Empty dict, not used for springs
-#     'node_list': [
-#         (1, 0.0, 0.0, 0.0),
-#         (2, 20.0, 0.0, 0.0),
-#         (3, 40.0, 0.0, 0.0),
-#         (4, 0.0, 20.0, 0.0),
-#         (5, 20.0, 20.0, 0.0),
-#         (6, 40.0, 20.0, 0.0)
-#     ],
-#     'boundary_condition': [1, 1, 1, 1, 1, 1],
-#     'element_start_id': 10000000,
-#     'spring_node_start_id': 11000000
-# }
-
-nodal_spring_configs = None
-# ===========================================================================================
-# PREPARE SHELL CONFIGURATIONS (SLABS AND FOOTINGS)
-# ===========================================================================================
-
-# Helper function for regular polygons
-def create_regular_polygon_nodes(center_x, center_y, radius, n_sides, start_id, z=0.0):
-    """Create regular polygon nodes dictionary"""
-    angles = np.linspace(0, 2*np.pi, n_sides + 1)[:-1]
-    nodes = {}
-    for i, angle in enumerate(angles):
-        x = center_x + radius * np.cos(angle)
-        y = center_y + radius * np.sin(angle)
-        nodes[start_id + i] = (x, y, z)
-    return nodes
-
-# Single unified configuration list for all shell structures
-slab_configs = [
-    # ============================================================
-    # SLABS
-    # ============================================================
-    {
-        'name': 'Slab_1',
-        'type': 'slab',
-        'boundary_nodes': {
-            1001: (0.0, 0.0, 10.0),
-            1002: (20.0, 0.0, 10.0),
-            1003: (20.0, 20.0, 10.0),
-            1004: (0.0, 20.0, 10.0)
-        },
-        'mesh_size': 2.0,
-        'internal_points': None,
-        'voids': None,
-                # ADD VOID (e.g., for drainage hole):
-        # 'voids': [
-            # {
-        #         30001: (-0.5, -0.5, 0.0),
-        #         30002: (0.5, -0.5, 0.0),
-        #         30003: (0.5, 0.5, 0.0),
-        #         30004: (-0.5, 0.5, 0.0)
-        #     }
-        # ],
+        # ================================================================
+        # SECTION 1: MODEL INITIALIZATION
+        # ================================================================
+        f.write("# " + "="*70 + "\n")
+        f.write("# SECTION 1: MODEL INITIALIZATION\n")
+        f.write("# " + "="*70 + "\n\n")
         
-        # # FONT SIZES:
-        # 'node_font_size': 9,      # Larger for footings
-        # 'element_font_size': 8,
+        f.write("print('Initializing OpenSees model...')\n")
+        f.write("ops.wipe()\n")
+        f.write(f"ops.model('basic', '-ndm', {model_params['ndm']}, '-ndf', {model_params['ndf']})\n")
+        # f.write("print('✓ Model initialized')\n\n")
+        f.write("print(' Model initialized')\n\n")
 
-        'py_file': 'slab1_model.py',
-        'png_file': 'slab1_mesh.png',
-        'shell_material_config': ("ElasticIsotropic", 10, 3600.0 * 144.0, 0.2, 0.150 * 1000.0),
-        'shell_section_config': ("PlateFiber", 10, 10, 8.0 / 12.0),
-        'ops_ele_type1': "ShellMITC4",
-        'ops_ele_type2': "ASDShellT3",
-        'shell_boundary_conditions': [0, 0, 0, 0, 0, 0],
-        'use_zero_length': False,
-        'element_start_id': 10000,
-        'spring_node_start_id': 1000000,
-        'start_node_id': 100000,      # Slab 1 mesh nodes start at 100000
-        'start_element_id': 110000,   # Slab 1 mesh elements start at 110000
-        'load_configs': {
-            'pressure': -100.0,
-            'time_series_tag': 101,
-            'pattern_tag': 201,
-            'element_tags': None
-        }
-    },
-    {
-        'name': 'Slab_2',
-        'type': 'slab',
-        'boundary_nodes': {
-            2001: (20.0, 0.0, 10.0),
-            2002: (40.0, 0.0, 10.0),
-            2003: (40.0, 20.0, 10.0),
-            2004: (20.0, 20.0, 10.0)
-        },
-        'mesh_size': 2.0,
-        'internal_points': None,
-        'voids': None,
-        'py_file': 'slab2_model.py',
-        'png_file': 'slab2_mesh.png',
-        'shell_material_config': ("ElasticIsotropic", 11, 3600.0 * 144.0, 0.2, 0.150 * 1000.0),
-        'shell_section_config': ("PlateFiber", 11, 11, 8.0 / 12.0),
-        'ops_ele_type1': "ShellMITC4",
-        'ops_ele_type2': "ASDShellT3",
-        'shell_boundary_conditions': [0, 0, 0, 0, 0, 0],
-        'use_zero_length': False,
-        'element_start_id': 20000,
-        'spring_node_start_id': 1100000,
-        'start_node_id': 120000,      # Slab 2 mesh nodes start at 120000
-        'start_element_id': 130000,   # Slab 2 mesh elements start at 130000
-        'load_configs': {
-            'pressure': -100.0,
-            'time_series_tag': 102,
-            'pattern_tag': 202,
-            'element_tags': None
-        }
-    },
-    
-    # ============================================================
-    # FOOTINGS
-    # ============================================================
-    {
-        'name': 'Footing_1_Square',
-        'type': 'footing',
-        'boundary_nodes': {
-            3001: (-3.0, -3.0, 0.0),
-            3002: (3.0, -3.0, 0.0),
-            3003: (3.0, 3.0, 0.0),
-            3004: (-3.0, 3.0, 0.0)
-        },
-        'mesh_size': 1.0,
-        'internal_points': None,
-        'voids': None,
-        'py_file': 'footing1_square.py',
-        'png_file': 'footing1_square.png',
-        'shell_material_config': ("ElasticIsotropic", 21, 3000.0 * 144.0, 0.2, 0.150 * 1000.0),
-        'shell_section_config': ("PlateFiber", 21, 21, 1.0),
-        'ops_ele_type1': "ShellMITC4",
-        'ops_ele_type2': "ASDShellT3",
-        'shell_boundary_conditions': [0, 0, 0, 0, 0, 0],
-        'use_zero_length': False,
-        'element_start_id': 30000,
-        'spring_node_start_id': 1200000,
-        'start_node_id': 140000,      # Footing 1 mesh nodes start at 140000
-        'start_element_id': 150000,   # Footing 1 mesh elements start at 150000
-        'load_configs': {
-            'pressure': -200.0,
-            'time_series_tag': 301,
-            'pattern_tag': 401,
-            'element_tags': None
-        }
-    },
-    {
-        'name': 'Footing_2_Hexagon',
-        'type': 'footing',
-        'boundary_nodes': create_regular_polygon_nodes(20.0, 0.0, 3.5, 6, 4001, 0.0),
-        'mesh_size': 1.0,
-        'internal_points': None,
-        'voids': None,
-        'py_file': 'footing2_hexagon.py',
-        'png_file': 'footing2_hexagon.png',
-        'shell_material_config': ("ElasticIsotropic", 22, 3000.0 * 144.0, 0.2, 0.150 * 1000.0),
-        'shell_section_config': ("PlateFiber", 22, 22, 1.0),
-        'ops_ele_type1': "ShellMITC4",
-        'ops_ele_type2': "ASDShellT3",
-        'shell_boundary_conditions': [0, 0, 0, 0, 0, 0],
-        'use_zero_length': False,
-        'element_start_id': 40000,
-        'spring_node_start_id': 1300000,
-        'start_node_id': 160000,      # Footing 2 mesh nodes start at 160000
-        'start_element_id': 170000,   # Footing 2 mesh elements start at 170000
-        'load_configs': {
-            'pressure': -200.0,
-            'time_series_tag': 302,
-            'pattern_tag': 402,
-            'element_tags': None
-        }
-    },
-    {
-        'name': 'Footing_3_Octagon',
-        'type': 'footing',
-        'boundary_nodes': create_regular_polygon_nodes(40.0, 0.0, 3.5, 8, 5001, 0.0),
-        'mesh_size': 1.0,
-        'internal_points': None,
-        'voids': None,
-        'py_file': 'footing3_octagon.py',
-        'png_file': 'footing3_octagon.png',
-        'shell_material_config': ("ElasticIsotropic", 23, 3000.0 * 144.0, 0.2, 0.150 * 1000.0),
-        'shell_section_config': ("PlateFiber", 23, 23, 1.0),
-        'ops_ele_type1': "ShellMITC4",
-        'ops_ele_type2': "ASDShellT3",
-        'shell_boundary_conditions': [0, 0, 0, 0, 0, 0],
-        'use_zero_length': False,
-        'element_start_id': 50000,
-        'spring_node_start_id': 1400000,
-        'start_node_id': 180000,      # Footing 3 mesh nodes start at 180000
-        'start_element_id': 190000,   # Footing 3 mesh elements start at 190000
-        'load_configs': {
-            'pressure': -200.0,
-            'time_series_tag': 303,
-            'pattern_tag': 403,
-            'element_tags': None
-        }
-    },
-    {
-        'name': 'Footing_4_Triangle',
-        'type': 'footing',
-        'boundary_nodes': {
-            6001: (-2.5, 17.0, 0.0),
-            6002: (2.5, 17.0, 0.0),
-            6003: (0.0, 23.0, 0.0)
-        },
-        'mesh_size': 1.0,
-        'internal_points': None,
-        'voids': None,
-        'py_file': 'footing4_triangle.py',
-        'png_file': 'footing4_triangle.png',
-        'shell_material_config': ("ElasticIsotropic", 24, 3000.0 * 144.0, 0.2, 0.150 * 1000.0),
-        'shell_section_config': ("PlateFiber", 24, 24, 1.0),
-        'ops_ele_type1': "ShellMITC4",
-        'ops_ele_type2': "ASDShellT3",
-        'shell_boundary_conditions': [0, 0, 0, 0, 0, 0],
-        'use_zero_length': False,
-        'element_start_id': 60000,
-        'spring_node_start_id': 1500000,
-        'start_node_id': 200000,      # Footing 4 mesh nodes start at 200000
-        'start_element_id': 210000,   # Footing 4 mesh elements start at 210000
-        'load_configs': {
-            'pressure': -200.0,
-            'time_series_tag': 304,
-            'pattern_tag': 404,
-            'element_tags': None
-        }
-    },
-    {
-        'name': 'Footing_5_Circle',
-        'type': 'footing',
-        'boundary_nodes': create_regular_polygon_nodes(20.0, 20.0, 3.5, 32, 7001, 0.0),
-        'mesh_size': 1.0,
-        'internal_points': None,
-        'voids': None,
-                # ADD VOID (e.g., for drainage hole):
-        # 'voids': [
-        #     {
-        #         30001: (-0.5, -0.5, 0.0),
-        #         30002: (0.5, -0.5, 0.0),
-        #         30003: (0.5, 0.5, 0.0),
-        #         30004: (-0.5, 0.5, 0.0)
-        #     }
-        # ],
         
-        # # FONT SIZES:
-        # 'node_font_size': 9,      # Larger for footings
-        # 'element_font_size': 8,
-
-        'py_file': 'footing5_circle.py',
-        'png_file': 'footing5_circle.png',
-        'shell_material_config': ("ElasticIsotropic", 25, 3000.0 * 144.0, 0.2, 0.150 * 1000.0),
-        'shell_section_config': ("PlateFiber", 25, 25, 1.0),
-        'ops_ele_type1': "ShellMITC4",
-        'ops_ele_type2': "ASDShellT3",
-        'shell_boundary_conditions': [0, 0, 0, 0, 0, 0],
-        'use_zero_length': False,
-        'element_start_id': 70000,
-        'spring_node_start_id': 1600000,
-        'start_node_id': 220000,      # Footing 5 mesh nodes start at 220000
-        'start_element_id': 230000,   # Footing 5 mesh elements start at 230000
-        'load_configs': {
-            'pressure': -200.0,
-            'time_series_tag': 305,
-            'pattern_tag': 405,
-            'element_tags': None
-        }
-    },
-    {
-        'name': 'Footing_6_L_Shaped',
-        'type': 'footing',
-        'boundary_nodes': {
-            8001: (37.0, 17.0, 0.0),
-            8002: (43.0, 17.0, 0.0),
-            8003: (43.0, 20.0, 0.0),
-            8004: (40.0, 20.0, 0.0),
-            8005: (40.0, 23.0, 0.0),
-            8006: (37.0, 23.0, 0.0)
-        },
-        'mesh_size': 1.0,
-        'internal_points': None,
-        'voids': None,
-        'py_file': 'footing6_lshaped.py',
-        'png_file': 'footing6_lshaped.png',
-        'shell_material_config': ("ElasticIsotropic", 26, 3000.0 * 144.0, 0.2, 0.150 * 1000.0),
-        'shell_section_config': ("PlateFiber", 26, 26, 1.0),
-        'ops_ele_type1': "ShellMITC4",
-        'ops_ele_type2': "ASDShellT3",
-        'shell_boundary_conditions': [0, 0, 0, 0, 0, 0],
-        'use_zero_length': False,
-        'element_start_id': 80000,
-        'spring_node_start_id': 1700000,
-        'start_node_id': 240000,      # Footing 6 mesh nodes start at 240000
-        'start_element_id': 250000,   # Footing 6 mesh elements start at 250000
-        'load_configs': {
-            'pressure': -200.0,
-            'time_series_tag': 306,
-            'pattern_tag': 406,
-            'element_tags': None
-        }
-    }
-]
-# start_node_id=start_node_id,  # ADD
-# start_element_id=start_element_id  # ADD
-# ===========================================================================================
-# BUILD MODEL WITH MULTIPLE SECTIONS
-# ===========================================================================================
-
-results = build_model(
-    model_params=model_params,
+        # ================================================================
+        # SECTION 2: UNIAXIAL MATERIALS
+        # ================================================================
+        f.write("# " + "="*70 + "\n")
+        f.write("# SECTION 2: UNIAXIAL MATERIALS\n")
+        f.write("# " + "="*70 + "\n\n")
+        
+        f.write("print('\\nDefining uniaxial materials...')\n")
+        for mat_param in material_params:
+            mat_str = ", ".join([repr(p) for p in mat_param])
+            f.write(f"ops.uniaxialMaterial({mat_str})\n")
+        f.write(f"print(' Defined {len(material_params)} uniaxial materials')\n\n")
+        
+        # ================================================================
+        # SECTION 3: FIBER SECTIONS
+        # ================================================================
+        f.write("# " + "="*70 + "\n")
+        f.write("# SECTION 3: FIBER SECTIONS\n")
+        f.write("# " + "="*70 + "\n\n")
+        
+        f.write("print('\\nCreating fiber sections...')\n")
+        for fiber_sec in fiber_section_info:
+            # Read fiber section commands from saved file
+            with open(fiber_sec['txt_path'], 'r') as sec_file:
+                sec_commands = sec_file.read()
+            
+            # Write the section commands
+            f.write(f"\n# Fiber Section {fiber_sec['sec_tag']}\n")
+            f.write(sec_commands)
+            f.write("\n")
+        
+        f.write(f"print(' Created {len(fiber_section_info)} fiber sections')\n\n")
+        
+        # ================================================================
+        # SECTION 4: NODES
+        # ================================================================
+        f.write("# " + "="*70 + "\n")
+        f.write("# SECTION 4: NODES\n")
+        f.write("# " + "="*70 + "\n\n")
+        
+        f.write("print('\\nCreating nodes...')\n\n")
+        
+        # Frame nodes
+        f.write("# Frame nodes\n")
+        for node_id, coords in sorted(node_coords.items()):
+            x, y, z = coords
+            f.write(f"ops.node({node_id}, {x}, {y}, {z})\n")
+        
+        f.write(f"\n# Created {len(node_coords)} frame nodes\n\n")
+        
+        # Shell nodes
+        if shell_meshes:
+            f.write("# Shell mesh nodes\n")
+            total_shell_nodes = 0
+            for shell_mesh in shell_meshes:
+                config_name = shell_mesh.get('config_name', 'Unknown')
+                f.write(f"\n# Nodes for {config_name}\n")
+                
+                for node_id, coords in sorted(shell_mesh['nodes'].items()):
+                    x, y, z = coords
+                    f.write(f"ops.node({node_id}, {x}, {y}, {z})\n")
+                
+                total_shell_nodes += len(shell_mesh['nodes'])
+            
+            f.write(f"\n# Created {total_shell_nodes} shell nodes\n\n")
+        
+        f.write(f"print(' Created {len(node_coords) + total_shell_nodes} total nodes')\n\n")
+        
+        # ================================================================
+        # SECTION 5: BOUNDARY CONDITIONS
+        # ================================================================
+        f.write("# " + "="*70 + "\n")
+        f.write("# SECTION 5: BOUNDARY CONDITIONS\n")
+        f.write("# " + "="*70 + "\n\n")
+        
+        f.write("print('\\nApplying boundary conditions...')\n\n")
+        
+        for node_id, dofs in sorted(boundary_conditions.items()):
+            dof_str = ", ".join([str(d) for d in dofs])
+            f.write(f"ops.fix({node_id}, {dof_str})\n")
+        
+        f.write(f"\nprint(' Applied boundary conditions to {len(boundary_conditions)} nodes')\n\n")
+        
+        # ================================================================
+        # SECTION 6: GEOMETRIC TRANSFORMATIONS
+        # ================================================================
+        f.write("# " + "="*70 + "\n")
+        f.write("# SECTION 6: GEOMETRIC TRANSFORMATIONS\n")
+        f.write("# " + "="*70 + "\n\n")
+        
+        f.write("print('\\nDefining geometric transformations...')\n\n")
+        
+        for transf in element_configs.get('transformations', []):
+            vecxz_str = ", ".join([str(v) for v in transf['vecxz']])
+            f.write(f"ops.geomTransf('{transf['type']}', {transf['tag']}, {vecxz_str})\n")
+        
+        f.write(f"\nprint(' Created {len(element_configs.get('transformations', []))} transformations')\n\n")
+        
+        # ================================================================
+        # SECTION 7: BEAM INTEGRATIONS
+        # ================================================================
+        f.write("# " + "="*70 + "\n")
+        f.write("# SECTION 7: BEAM INTEGRATIONS\n")
+        f.write("# " + "="*70 + "\n\n")
+        
+        f.write("print('\\nDefining beam integrations...')\n\n")
+        
+        for integ in element_configs.get('integrations', []):
+            f.write(f"ops.beamIntegration('{integ['type']}', {integ['tag']}, "
+                   f"{integ['sec_tag']}, {integ['np']})\n")
+        
+        f.write(f"\nprint(' Created {len(element_configs.get('integrations', []))} integrations')\n\n")
+        
+        # ================================================================
+        # SECTION 8: ELASTIC SECTIONS
+        # ================================================================
+        if element_configs.get('elastic_sections'):
+            f.write("# " + "="*70 + "\n")
+            f.write("# SECTION 8: ELASTIC SECTIONS\n")
+            f.write("# " + "="*70 + "\n\n")
+            
+            f.write("print('\\nDefining elastic sections...')\n\n")
+            
+            for elastic_sec in element_configs.get('elastic_sections', []):
+                f.write(f"ops.section('Elastic', {elastic_sec['sec_tag']}, "
+                       f"{elastic_sec['E']}, {elastic_sec['A']}, "
+                       f"{elastic_sec['Iz']}, {elastic_sec['Iy']}, "
+                       f"{elastic_sec['G']}, {elastic_sec['J']})\n")
+            
+            f.write(f"\nprint(' Created {len(element_configs.get('elastic_sections', []))} elastic sections')\n\n")
+        
+        # ================================================================
+        # SECTION 9: BEAM/COLUMN ELEMENTS
+        # ================================================================
+        f.write("# " + "="*70 + "\n")
+        f.write("# SECTION 9: BEAM/COLUMN ELEMENTS\n")
+        f.write("# " + "="*70 + "\n\n")
+        
+        f.write("print('\\nCreating beam/column elements...')\n\n")
+        
+        # Force beam columns (fiber sections)
+        f.write("# Force beam columns (fiber sections)\n")
+        for col in element_configs.get('force_beam_columns', []):
+            f.write(f"ops.element('forceBeamColumn', {col['tag']}, "
+                   f"{col['node_i']}, {col['node_j']}, "
+                   f"{col['transf_tag']}, {col['integ_tag']})\n")
+        
+        col_count = len(element_configs.get('force_beam_columns', []))
+        f.write(f"\n# Created {col_count} fiber section columns\n\n")
+        
+        # Elastic beam columns
+        f.write("# Elastic beam columns\n")
+        for beam in element_configs.get('elastic_beam_columns', []):
+            f.write(f"ops.element('elasticBeamColumn', {beam['tag']}, "
+                   f"{beam['node_i']}, {beam['node_j']}, "
+                   f"{beam['A']}, {beam['E']}, {beam['G']}, {beam['J']}, "
+                   f"{beam['Iy']}, {beam['Iz']}, {beam['transf_tag']})\n")
+        
+        beam_count = len(element_configs.get('elastic_beam_columns', []))
+        f.write(f"\n# Created {beam_count} elastic beams\n")
+        f.write(f"\nprint(' Created {col_count + beam_count} beam/column elements')\n\n")
+        
+        # ================================================================
+        # SECTION 10: SHELL ELEMENTS
+        # ================================================================
+        if shell_meshes:
+            f.write("# " + "="*70 + "\n")
+            f.write("# SECTION 10: SHELL ELEMENTS\n")
+            f.write("# " + "="*70 + "\n\n")
+            
+            f.write("print('\\nCreating shell elements...')\n\n")
+            
+            total_shell_elements = 0
+            
+            for shell_mesh in shell_meshes:
+                config_name = shell_mesh.get('config_name', 'Unknown')
+                
+                # Find matching config
+                shell_mat_config = None
+                shell_sec_config = None
+                
+                for config in slab_configs:
+                    if config.get('name') == config_name:
+                        shell_mat_config = config['shell_material_config']
+                        shell_sec_config = config['shell_section_config']
+                        break
+                
+                if shell_mat_config is None or shell_sec_config is None:
+                    continue
+                
+                # Write material and section
+                f.write(f"# Shell material and section for {config_name}\n")
+                
+                mat_str = ", ".join([repr(p) for p in shell_mat_config])
+                f.write(f"ops.nDMaterial({mat_str})\n")
+                
+                sec_str = ", ".join([repr(p) for p in shell_sec_config])
+                f.write(f"ops.section({sec_str})\n\n")
+                
+                sec_tag = shell_sec_config[1]
+                
+                # Write quad4 elements
+                f.write(f"# Quad4 elements for {config_name}\n")
+                for elem in shell_mesh['quad4']:
+                    node_str = ", ".join([str(n) for n in elem['nodes']])
+                    f.write(f"ops.element('ShellMITC4', {elem['tag']}, {node_str}, {sec_tag})\n")
+                
+                # Write tri3 elements
+                if shell_mesh['tri3']:
+                    f.write(f"\n# Tri3 elements for {config_name}\n")
+                    for elem in shell_mesh['tri3']:
+                        node_str = ", ".join([str(n) for n in elem['nodes']])
+                        f.write(f"ops.element('ASDShellT3', {elem['tag']}, {node_str}, {sec_tag})\n")
+                
+                elem_count = len(shell_mesh['quad4']) + len(shell_mesh['tri3'])
+                total_shell_elements += elem_count
+                f.write(f"\n# Created {elem_count} elements for {config_name}\n\n")
+            
+            f.write(f"print(' Created {total_shell_elements} shell elements')\n\n")
+        
+        # ================================================================
+        # SECTION 11: ZERO-LENGTH SPRINGS
+        # ================================================================
+        if nodal_spring_configs:
+            f.write("# " + "="*70 + "\n")
+            f.write("# SECTION 11: ZERO-LENGTH SPRINGS\n")
+            f.write("# " + "="*70 + "\n\n")
+            
+            f.write("print('\\nCreating zero-length springs...')\n\n")
+            
+            # Write spring material
+            mat_config = nodal_spring_configs['material_props']['config']
+            mat_str = ", ".join([repr(p) for p in mat_config])
+            f.write(f"# Spring material\n")
+            f.write(f"ops.uniaxialMaterial({mat_str})\n\n")
+            
+            # Write spring nodes and elements
+            mat_id = nodal_spring_configs['material_props']['id']
+            directions = nodal_spring_configs['material_props']['directions']
+            boundary_condition = nodal_spring_configs['boundary_condition']
+            element_start_id = nodal_spring_configs['element_start_id']
+            spring_node_start_id = nodal_spring_configs['spring_node_start_id']
+            
+            f.write("# Spring nodes and elements\n")
+            
+            spring_count = 0
+            for i, (node_id, x, y, z) in enumerate(nodal_spring_configs['node_list']):
+                spring_node_id = spring_node_start_id + i
+                elem_id = element_start_id + i
+                
+                bc_str = ", ".join([str(d) for d in boundary_condition])
+                dir_str = ", ".join([str(d) for d in directions])
+                
+                f.write(f"\n# Spring at node {node_id}\n")
+                f.write(f"ops.node({spring_node_id}, {x}, {y}, {z})\n")
+                f.write(f"ops.fix({spring_node_id}, {bc_str})\n")
+                f.write(f"ops.element('zeroLength', {elem_id}, {node_id}, {spring_node_id}, "
+                       f"'-mat', {mat_id}, '-dir', {dir_str})\n")
+                
+                spring_count += 1
+            
+            f.write(f"\nprint('✓ Created {spring_count} zero-length springs')\n\n")
+        
+        # ================================================================
+        # SECTION 12: LOADS
+        # ================================================================
+        if load_configs:
+            f.write("# " + "="*70 + "\n")
+            f.write("# SECTION 12: LOADS\n")
+            f.write("# " + "="*70 + "\n\n")
+            
+            f.write("print('\\nApplying loads...')\n\n")
+            
+            # Time series
+            if 'time_series' in load_configs:
+                f.write("# Time series\n")
+                for ts in load_configs['time_series']:
+                    if ts['type'] == 'Linear':
+                        f.write(f"ops.timeSeries('Linear', {ts['tag']})\n")
+                    elif ts['type'] == 'Constant':
+                        f.write(f"ops.timeSeries('Constant', {ts['tag']})\n")
+                f.write("\n")
+            
+            # Patterns
+            if 'patterns' in load_configs:
+                f.write("# Load patterns\n")
+                for pattern in load_configs['patterns']:
+                    f.write(f"ops.pattern('Plain', {pattern['tag']}, {pattern['ts_tag']})\n")
+                f.write("\n")
+            
+            # Nodal loads
+            if 'nodal_loads' in load_configs:
+                f.write("# Nodal loads\n")
+                for load_group in load_configs['nodal_loads']:
+                    for load in load_group['loads']:
+                        force_str = ", ".join([str(f) for f in load['forces']])
+                        f.write(f"ops.load({load['node']}, {force_str})\n")
+                f.write("\n")
+            
+            # Beam uniform loads
+            if 'beam_uniform_loads' in load_configs:
+                f.write("# Beam uniform loads\n")
+                for load_group in load_configs['beam_uniform_loads']:
+                    for load in load_group['loads']:
+                        elem_str = str(load['elements'])
+                        f.write(f"opst.pre.transform_beam_uniform_load({elem_str}, "
+                               f"wy={load['wy']}, wz={load['wz']})\n")
+                f.write("\n")
+            
+            # Beam point loads
+            if 'beam_point_loads' in load_configs:
+                f.write("# Beam point loads\n")
+                for load_group in load_configs['beam_point_loads']:
+                    for load in load_group['loads']:
+                        f.write(f"opst.pre.transform_beam_point_load([{load['element']}], "
+                               f"py={load['py']}, pz={load['pz']}, xl={load['xl']})\n")
+                f.write("\n")
+            
+            # Shell surface loads
+            if 'shell_surface_loads' in load_configs:
+                f.write("# Shell surface loads\n")
+                for load_group in load_configs['shell_surface_loads']:
+                    for load in load_group['loads']:
+                        # Find mesh
+                        for shell_mesh in shell_meshes:
+                            if shell_mesh.get('config_name') == load['mesh_name']:
+                                if load['elements'] is None:
+                                    element_tags = [elem['tag'] for elem in shell_mesh['quad4']]
+                                    element_tags += [elem['tag'] for elem in shell_mesh['tri3']]
+                                else:
+                                    element_tags = load['elements']
+                                
+                                f.write(f"# Surface load on {load['mesh_name']}\n")
+                                f.write(f"opst.pre.transform_surface_uniform_load("
+                                       f"ele_tags={element_tags}, p={load['pressure']})\n")
+                                break
+                f.write("\n")
+            
+            f.write("print(' Loads applied')\n\n")
+        
+        # ================================================================
+        # SECTION 13: MASSES
+        # ================================================================
+        if mass_configs:
+            f.write("# " + "="*70 + "\n")
+            f.write("# SECTION 13: MASSES\n")
+            f.write("# " + "="*70 + "\n\n")
+            
+            f.write("print('\\nApplying masses...')\n\n")
+            
+            # Initialize mass dictionary
+            f.write("# Initialize nodal masses\n")
+            f.write("nodal_masses = {}\n\n")
+            
+            # Beam/column masses
+            if 'beam_column_mass' in mass_configs:
+                f.write("# Beam/column masses\n")
+                f.write("node_coords = {\n")
+                for node_id, coords in sorted(node_coords.items()):
+                    f.write(f"    {node_id}: {coords},\n")
+                f.write("}\n\n")
+                
+                for item in mass_configs['beam_column_mass']:
+                    tag = item['tag']
+                    density = item['density']
+                    area = item['area']
+                    
+                    # Find nodes (simplified - assumes user knows node_i, node_j)
+                    f.write(f"\n# Element {tag}\n")
+                    f.write(f"# Calculate and add mass for element {tag}\n")
+                    f.write(f"# density={density}, area={area}\n")
+                
+                f.write("\n")
+            
+            # Nodal masses
+            if 'nodal_mass' in mass_configs:
+                f.write("# Direct nodal masses\n")
+                for item in mass_configs['nodal_mass']:
+                    node_id = item['node']
+                    mass_value = item['mass']
+                    f.write(f"if {node_id} not in nodal_masses:\n")
+                    f.write(f"    nodal_masses[{node_id}] = 0.0\n")
+                    f.write(f"nodal_masses[{node_id}] += {mass_value}\n")
+                f.write("\n")
+            
+            # Apply masses
+            f.write("# Apply masses to OpenSees model\n")
+            f.write("for node_id, mass_value in nodal_masses.items():\n")
+            f.write("    if mass_value > 0:\n")
+            f.write("        ops.mass(node_id, mass_value, mass_value, mass_value, 0.0, 0.0, 0.0)\n\n")
+            
+            f.write("print(' Masses applied')\n\n")
+        
+        # ================================================================
+        # FOOTER
+        # ================================================================
+        f.write("# " + "="*70 + "\n")
+        f.write("# MODEL CREATION COMPLETE\n")
+        f.write("# " + "="*70 + "\n\n")
+        
+        f.write("print('\\n' + '='*70)\n")
+        f.write("print('MODEL CREATION COMPLETE')\n")
+        f.write("print('='*70)\n")
+        f.write("print(f'Total nodes: {len(ops.getNodeTags())}')\n")
+        f.write("print(f'Total elements: {len(ops.getEleTags())}')\n")
+        f.write("print('='*70)\n")
     
-    # Pass all 3 fiber sections
-    materials_list=[
-        concrete_materials,  # Section 1 (2x2 rect, 4 bars)
-        concrete_materials,  # Section 2 (2x3 rect, 6 bars)
-        concrete_materials   # Section 3 (circular, 8 bars)
-    ],
-    
-    outline_points_list=[
-        column_rect_2x2_outline,
-        column_rect_2x3_outline,
-        column_circular_outline
-    ],
-    
-    rebar_configs_list=[
-        column_rect_2x2_rebar,
-        column_rect_2x3_rebar,
-        column_circular_rebar
-    ],
-    
-    section_params_list=[
-        {
-            'cover': column_rect_2x2_cover,
-            'mesh_size': 0.5,
-            'mat_tags': column_rect_2x2_mat_tags,
-            'sec_tag': 1,
-            'G': G_concrete,
-            'save_prefix': 'column_rect_2x2_4bars',
-            'section_name': 'Rect_2x2_4bars'
-        },
-        {
-            'cover': column_rect_2x3_cover,
-            'mesh_size': 0.5,
-            'mat_tags': column_rect_2x3_mat_tags,
-            'sec_tag': 2,
-            'G': G_concrete,
-            'save_prefix': 'column_rect_2x3_6bars',
-            'section_name': 'Rect_2x3_6bars'
-        },
-        {
-            'cover': column_circular_cover,
-            'mesh_size': 0.5,
-            'mat_tags': column_circular_mat_tags,
-            'sec_tag': 3,
-            'G': G_concrete,
-            'save_prefix': 'column_circular_8bars',
-            'section_name': 'Circular_2ft_8bars'
-        }
-    ],
-    
-    material_params=material_params,
-    node_coords=node_coords_dict,
-    boundary_conditions=boundary_conditions_dict,
-    element_configs=element_configs_dict,
-    spring_configs=spring_configs,
-    nodal_spring_configs=nodal_spring_configs,
-
-    output_dir="output",
-    
-    # NEW: Single unified parameter for all shell structures (slabs, footings, walls, etc.)
-    slab_configs=slab_configs,
-    
-    visualize=True
-)
-
-print("\n" + "="*80)
-print("MODEL GENERATION COMPLETE!")
-print("="*80)
-print(f"\nResults Summary:")
-print(f"  - Fiber Sections: {len(results['fiber_sections'])}")
-print(f"  - Shell Meshes: {len(results['shell_meshes'])}")
-print(f"  - Total Nodes: {results['total_nodes']}")
-print(f"  - Total Elements: {results['total_elements']}")
-print("\nShell Meshes Created:")
-for i, mesh in enumerate(results['shell_meshes'], 1):
-    print(f"  {i}. {mesh['config_name']}: {len(mesh['nodes'])} nodes, "
-          f"{len(mesh['quad4']) + len(mesh['tri3'])} elements")
-    
+    print(f"\n{'='*70}")
+    print(f"COMPLETE MODEL FILE GENERATED")
+    print(f"{'='*70}")
+    print(f"File saved to: {output_filepath}")
+    print(f"{'='*70}\n")
 
