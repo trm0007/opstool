@@ -913,6 +913,64 @@ def apply_loads_and_masses(load_configs, mass_configs, shell_meshes,
             
             results['mass_summary']['beam_column_mass'] = beam_col_mass_applied
         
+        # ==================================================================
+        # NEW: Additional beam distributed mass
+        # ==================================================================
+        if 'beam_additional_mass' in mass_configs:
+            print("\nApplying additional beam masses...")
+            total_beam_additional_mass = 0.0
+            
+            for item in mass_configs['beam_additional_mass']:
+                element_tags = item['element_tags']
+                mass_per_length = item['mass_per_length']  # kips/ft
+                description = item.get('description', 'Additional beam mass')
+                
+                for etag in element_tags:
+                    # Find element nodes
+                    node_i, node_j = None, None
+                    element_found = False
+                    
+                    # Search in force beam columns
+                    for col in element_configs['force_beam_columns']:
+                        if col['tag'] == etag:
+                            node_i, node_j = col['node_i'], col['node_j']
+                            element_found = True
+                            break
+                    
+                    # Search in elastic beam columns
+                    if not element_found:
+                        for beam in element_configs['elastic_beam_columns']:
+                            if beam['tag'] == etag:
+                                node_i, node_j = beam['node_i'], beam['node_j']
+                                element_found = True
+                                break
+                    
+                    if not element_found:
+                        raise ValueError(f"Element {etag} not found for beam mass")
+                    
+                    # Calculate element length
+                    xi, yi, zi = node_coords[node_i]
+                    xj, yj, zj = node_coords[node_j]
+                    length = ((xj-xi)**2 + (yj-yi)**2 + (zj-zi)**2)**0.5
+                    
+                    # Calculate total mass and distribute to nodes
+                    total_mass = mass_per_length * length
+                    half_mass = total_mass / 2.0
+                    
+                    if node_i not in nodal_masses:
+                        nodal_masses[node_i] = 0.0
+                    if node_j not in nodal_masses:
+                        nodal_masses[node_j] = 0.0
+                    
+                    nodal_masses[node_i] += half_mass
+                    nodal_masses[node_j] += half_mass
+                    
+                    total_beam_additional_mass += total_mass
+            
+            results['mass_summary']['beam_additional_mass'] = total_beam_additional_mass
+            print(f"Applied {total_beam_additional_mass:.2f} kips additional beam mass")
+    
+        
         if 'nodal_mass' in mass_configs:
             node_mass_groups = defaultdict(list)
             for item in mass_configs['nodal_mass']:
@@ -990,6 +1048,67 @@ def apply_loads_and_masses(load_configs, mass_configs, shell_meshes,
                     total_shell_mass_applied += mesh_total_mass
                 
                 results['mass_summary']['shell_mass_total'] = total_shell_mass_applied
+
+        # ==================================================================
+        # NEW: Additional shell distributed mass
+        # ==================================================================
+        if 'shell_additional_mass' in mass_configs:
+            print("\nApplying additional shell masses...")
+            
+            if not shell_meshes:
+                raise ValueError("shell_meshes required for shell_additional_mass")
+            
+            if not has_opstool:
+                raise ImportError("opstool required for shell mass calculation")
+            
+            total_shell_additional_mass = 0.0
+            
+            for item in mass_configs['shell_additional_mass']:
+                mesh_name = item['mesh_name']
+                mass_per_area = item['mass_per_area']  # kips/sf
+                specific_elements = item.get('element_tags', None)
+                description = item.get('description', 'Additional shell mass')
+                
+                # Find the target mesh
+                target_mesh = None
+                for mesh in shell_meshes:
+                    if mesh.get('config_name') == mesh_name:
+                        target_mesh = mesh
+                        break
+                
+                if target_mesh is None:
+                    raise ValueError(f"Mesh '{mesh_name}' not found")
+                
+                # Get element tags
+                if specific_elements is None:
+                    shell_ele_tags = [elem['tag'] for elem in target_mesh['quad4']]
+                    shell_ele_tags += [elem['tag'] for elem in target_mesh['tri3']]
+                else:
+                    shell_ele_tags = specific_elements
+                
+                # Calculate nodal masses from element areas
+                shell_nodal_masses = _calculate_shell_mass_from_areas(
+                    ele_tags=shell_ele_tags,
+                    density=mass_per_area,  # Already in kips/sf
+                    thickness=1.0,  # Thickness = 1.0 since density is already mass/area
+                    opst=opst
+                )
+                
+                # Add to total nodal masses
+                mesh_total_mass = 0.0
+                for node_id, shell_mass in shell_nodal_masses.items():
+                    if node_id not in nodal_masses:
+                        nodal_masses[node_id] = 0.0
+                    
+                    nodal_masses[node_id] += shell_mass
+                    mesh_total_mass += shell_mass
+                
+                total_shell_additional_mass += mesh_total_mass
+                print(f"  {mesh_name}: {mesh_total_mass:.2f} kips ({description})")
+            
+            results['mass_summary']['shell_additional_mass'] = total_shell_additional_mass
+            print(f"Applied {total_shell_additional_mass:.2f} kips total additional shell mass")
+    
         
         nodes_with_mass = 0
         total_mass_applied = 0.0
@@ -1059,8 +1178,7 @@ def _calculate_shell_mass_from_areas(ele_tags, density, thickness, opst):
 def build_model(model_params, materials_list, outline_points_list, 
                 rebar_configs_list, section_params_list, material_params,
                 node_coords, boundary_conditions, element_configs,
-                spring_configs, nodal_spring_configs, start_base_node_id,
-                diaphragm_list, start_node_id, start_element_id,
+                spring_configs, nodal_spring_configs, diaphragm_list,
                 load_configs, mass_configs, visualize, output_dir,
                 slab_configs, existing_frame_nodes):
     """Build complete OpenSeesPy 3D frame model"""
@@ -1325,6 +1443,7 @@ def build_model(model_params, materials_list, outline_points_list,
             element_configs=element_configs,
             node_coords=node_coords
         )
+        calculated_nodal_masses = results.get('nodal_masses', {})
     
     # Visualization
     if visualize:
@@ -1399,7 +1518,9 @@ def build_model(model_params, materials_list, outline_points_list,
         nodal_spring_configs=nodal_spring_configs_to_pass,
         load_configs=load_configs,
         mass_configs=mass_configs,
-        diaphragm_list=diaphragm_list
+        diaphragm_list=diaphragm_list,
+        calculated_nodal_masses=calculated_nodal_masses  # ADD THIS!
+
     )
     
     return {
@@ -1414,7 +1535,7 @@ def generate_complete_model_file(output_filepath, model_params, fiber_section_in
                                  material_params, node_coords, shell_meshes,
                                  slab_configs, boundary_conditions, element_configs,
                                  nodal_spring_configs, load_configs, mass_configs,
-                                 diaphragm_list):
+                                 diaphragm_list, calculated_nodal_masses=None):
     """Generate final_complete_model.py with all components"""
     
     with open(output_filepath, 'w') as f:
@@ -1660,25 +1781,50 @@ def generate_complete_model_file(output_filepath, model_params, fiber_section_in
             
             f.write("print('Loads applied')\n\n")
         
-        # Masses
-        if mass_configs:
-            f.write("# Masses\n")
-            f.write("nodal_masses = {}\n\n")
+        # # Masses
+        # if mass_configs:
+        #     f.write("# Masses\n")
+        #     f.write("nodal_masses = {}\n\n")
             
-            if 'nodal_mass' in mass_configs:
-                for item in mass_configs['nodal_mass']:
-                    node_id = item['node']
-                    mass_value = item['mass']
-                    f.write(f"if {node_id} not in nodal_masses:\n")
-                    f.write(f"    nodal_masses[{node_id}] = 0.0\n")
-                    f.write(f"nodal_masses[{node_id}] += {mass_value}\n")
-                f.write("\n")
+        #     # ADD THIS: Beam/column mass calculation
+        #     if 'beam_column_mass' in mass_configs:
+        #         f.write("# Beam masses\n")
+        #         for item in mass_configs['beam_column_mass']:
+        #             f.write(f"# Element {item['tag']} mass calculation needed\n")
+        #         f.write("\n")
+
+        #     if 'nodal_mass' in mass_configs:
+        #         for item in mass_configs['nodal_mass']:
+        #             node_id = item['node']
+        #             mass_value = item['mass']
+        #             f.write(f"if {node_id} not in nodal_masses:\n")
+        #             f.write(f"    nodal_masses[{node_id}] = 0.0\n")
+        #             f.write(f"nodal_masses[{node_id}] += {mass_value}\n")
+        #         f.write("\n")
             
-            f.write("for node_id, mass_value in nodal_masses.items():\n")
-            f.write("    if mass_value > 0:\n")
-            f.write("        ops.mass(node_id, mass_value, mass_value, mass_value, 0.0, 0.0, 0.0)\n\n")
+        #     f.write("for node_id, mass_value in nodal_masses.items():\n")
+        #     f.write("    if mass_value > 0:\n")
+        #     f.write("        ops.mass(node_id, mass_value, mass_value, mass_value, 0.0, 0.0, 0.0)\n\n")
+            
+        #     f.write("print('Masses applied')\n\n")
+
+        # Masses - using pre-calculated values
+        if calculated_nodal_masses:
+            f.write("# Masses (pre-calculated from model build)\n")
+            f.write("print('Applying pre-calculated masses...')\n")
+            
+            # Write ops.mass() commands for all nodes with mass > 0
+            for node_id, mass_value in sorted(calculated_nodal_masses.items()):
+                if mass_value > 0:
+                    f.write(f"ops.mass({node_id}, {mass_value}, {mass_value}, {mass_value}, 0.0, 0.0, 0.0)\n")
             
             f.write("print('Masses applied')\n\n")
+        else:
+            # Fallback to old method if no pre-calculated masses
+            f.write("# Masses (WARNING: Not pre-calculated)\n")
+            f.write("# This generated file cannot calculate beam/column masses\n")
+            f.write("# Run the original model build for proper mass calculation\n")
+            f.write("print('WARNING: Masses not properly calculated in this generated file')\n\n")
         
         # Footer
         f.write("print('\\n' + '='*70)\n")
@@ -1689,6 +1835,4 @@ def generate_complete_model_file(output_filepath, model_params, fiber_section_in
         f.write("print('='*70)\n")
     
     print(f"\nGenerated: {output_filepath}")
-
-
 
