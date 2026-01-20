@@ -1,20 +1,469 @@
 import matplotlib
-import numpy as np
-matplotlib.use('Agg')  # Set non-interactive backend BEFORE other imports
+matplotlib.use('Agg')  # Set non-interactive backend FIRST
 
-import matplotlib.pyplot as plt
 import os
 import json
-from sectionproperties.pre.library import concrete_rectangular_section
+import numpy as np
+import matplotlib.pyplot as plt
 
+# sectionproperties imports
+from sectionproperties.pre import Geometry
+from sectionproperties.pre.library import (
+    rectangular_section,
+    circular_section,
+    circular_section_by_area,
+    i_section,
+    concrete_rectangular_section,
+)
+
+# concreteproperties imports
 from concreteproperties import (
     Concrete,
     ConcreteLinear,
     ConcreteSection,
     RectangularStressBlock,
+    Steel,
     SteelBar,
     SteelElasticPlastic,
+    add_bar,
+    add_bar_rectangular_array,
+    add_bar_circular_array,
 )
+
+def create_dynamic_concrete_section(
+    # Base geometry configuration
+    base_geometry_type,  # "rectangular", "circular", "i_section", "custom_points"
+    base_geometry_params,  # dict with parameters
+    base_material,  # Concrete or Steel material object
+    
+    # Additional geometries (for composite sections)
+    additional_geometries=None,  # list of dicts with {type, params, material, operation}
+    
+    # Holes
+    holes=None,  # list of dicts with {type, params}
+    
+    # Reinforcement
+    reinforcement=None,  # list of dicts with reinforcement configurations
+    
+    # Section options
+    moment_centroid=None,
+    geometric_centroid_override=False,
+    
+    # Save options
+    save_plot_path=None,
+    plot_title="Dynamic Concrete Section",
+):
+    """
+    Create a dynamic concrete section with any configuration.
+    
+    Parameters:
+    -----------
+    base_geometry_type : str
+        Type of base geometry: "rectangular", "circular", "i_section", "custom_points"
+    
+    base_geometry_params : dict
+        Parameters for base geometry:
+        - rectangular: {"d": depth, "b": width}
+        - circular: {"d": diameter, "n": segments}
+        - i_section: {"d": depth, "b": width, "t_f": flange_thick, "t_w": web_thick, "r": radius, "n_r": segments}
+        - custom_points: {"points": [(x,y), ...], "facets": [(i,j), ...], "control_points": [(x,y), ...]}
+    
+    base_material : Material
+        Concrete or Steel material object for base geometry
+    
+    additional_geometries : list of dict or None
+        List of additional geometries to add/subtract:
+        Each dict: {
+            "type": "rectangular" | "circular" | "i_section" | "custom_points",
+            "params": {...},
+            "material": Material object,
+            "operation": "add" | "subtract",
+            "align": {"to": "center" | "previous", "on": "left" | "right" | "top" | "bottom", "inner": bool}
+        }
+    
+    holes : list of dict or None
+        List of holes to create:
+        Each dict: {
+            "type": "rectangular" | "circular",
+            "params": {...},
+            "align": {"to": "center" | geometry_index, "on": ..., "offset": (x, y)}
+        }
+    
+    reinforcement : list of dict or None
+        List of reinforcement to add:
+        Each dict: {
+            "type": "single_bar" | "rectangular_array" | "circular_array",
+            "material": SteelBar material object,
+            "params": {...}
+        }
+    
+    moment_centroid : tuple or None
+        Custom moment centroid (x, y)
+    
+    geometric_centroid_override : bool
+        Use geometric centroid for moment calculations
+    
+    save_plot_path : str or None
+        Path to save section plot
+    
+    plot_title : str
+        Title for section plot
+    
+    Returns:
+    --------
+    ConcreteSection object
+    
+    Example:
+    --------
+    >>> # Create a hollow rectangular section with reinforcement
+    >>> section = create_dynamic_concrete_section(
+    ...     base_geometry_type="rectangular",
+    ...     base_geometry_params={"d": 600, "b": 400},
+    ...     base_material=concrete,
+    ...     holes=[{
+    ...         "type": "rectangular",
+    ...         "params": {"d": 400, "b": 200},
+    ...         "align": {"to": "center"}
+    ...     }],
+    ...     reinforcement=[{
+    ...         "type": "rectangular_array",
+    ...         "material": steel,
+    ...         "params": {"area": 310, "n_x": 3, "x_s": 150, "n_y": 2, "y_s": 520, "anchor": (40, 40)}
+    ...     }]
+    ... )
+    """
+    
+    # Step 1: Create base geometry
+    geom = _create_geometry(base_geometry_type, base_geometry_params, base_material)
+    
+    # Step 2: Add additional geometries
+    if additional_geometries:
+        for add_geom in additional_geometries:
+            new_geom = _create_geometry(
+                add_geom["type"],
+                add_geom["params"],
+                add_geom.get("material", base_material)
+            )
+            
+            # Apply alignment if specified
+            if "align" in add_geom:
+                new_geom = _apply_alignment(new_geom, geom, add_geom["align"])
+            
+            # Apply operation
+            operation = add_geom.get("operation", "add")
+            if operation == "add":
+                geom = geom + new_geom
+            elif operation == "subtract":
+                geom = geom - new_geom
+    
+    # Step 3: Create holes
+    if holes:
+        for hole in holes:
+            hole_geom = _create_geometry(hole["type"], hole["params"], base_material)
+            
+            # Apply alignment
+            if "align" in hole:
+                hole_geom = _apply_alignment(hole_geom, geom, hole["align"])
+            
+            # Subtract hole
+            geom = geom - hole_geom
+    
+    # Step 4: Add reinforcement
+    if reinforcement:
+        for rebar in reinforcement:
+            rebar_type = rebar["type"]
+            rebar_material = rebar["material"]
+            rebar_params = rebar["params"]
+            
+            if rebar_type == "single_bar":
+                geom = add_bar(
+                    geometry=geom,
+                    material=rebar_material,
+                    **rebar_params
+                )
+            elif rebar_type == "rectangular_array":
+                geom = add_bar_rectangular_array(
+                    geometry=geom,
+                    material=rebar_material,
+                    **rebar_params
+                )
+            elif rebar_type == "circular_array":
+                geom = add_bar_circular_array(
+                    geometry=geom,
+                    material=rebar_material,
+                    **rebar_params
+                )
+    
+    # Step 5: Create concrete section
+    conc_sec = ConcreteSection(
+        geometry=geom,
+        moment_centroid=moment_centroid,
+        geometric_centroid_override=geometric_centroid_override,
+    )
+    
+    # Step 6: Plot and save if requested
+    if save_plot_path:
+        ax = conc_sec.plot_section(title=plot_title, render=False)
+        os.makedirs(os.path.dirname(save_plot_path) if os.path.dirname(save_plot_path) else '.', exist_ok=True)
+        ax.get_figure().savefig(save_plot_path, bbox_inches='tight', dpi=150)
+        plt.close(ax.get_figure())
+        print(f"Section plot saved to: {save_plot_path}")
+    
+    return conc_sec
+
+
+def _create_geometry(geom_type, params, material):
+    """Helper function to create geometry based on type and parameters."""
+    if geom_type == "rectangular":
+        return rectangular_section(
+            d=params["d"],
+            b=params["b"],
+            material=material
+        )
+    
+    elif geom_type == "circular":
+        if "area" in params:
+            return circular_section_by_area(
+                area=params["area"],
+                n=params.get("n", 32),
+                material=material
+            )
+        else:
+            return circular_section(
+                d=params["d"],
+                n=params.get("n", 32),
+                material=material
+            )
+    
+    elif geom_type == "i_section":
+        return i_section(
+            d=params["d"],
+            b=params["b"],
+            t_f=params["t_f"],
+            t_w=params["t_w"],
+            r=params["r"],
+            n_r=params.get("n_r", 8),
+            material=material
+        )
+    
+    elif geom_type == "custom_points":
+        return Geometry.from_points(
+            points=params["points"],
+            facets=params["facets"],
+            control_points=params["control_points"],
+            holes=params.get("holes"),
+            material=material
+        )
+    
+    else:
+        raise ValueError(f"Unknown geometry type: {geom_type}")
+
+
+def _apply_alignment(geom_to_align, reference_geom, align_config):
+    """Helper function to apply alignment to geometry."""
+    align_to = align_config.get("to", "center")
+    
+    if align_to == "center":
+        geom_to_align = geom_to_align.align_center(align_to=reference_geom)
+    elif align_to == "previous":
+        on = align_config.get("on")
+        inner = align_config.get("inner", False)
+        if on:
+            geom_to_align = geom_to_align.align_to(
+                other=reference_geom,
+                on=on,
+                inner=inner
+            )
+    
+    # Apply offset if specified
+    if "offset" in align_config:
+        offset_x, offset_y = align_config["offset"]
+        geom_to_align = geom_to_align.shift_section(
+            x_offset=offset_x,
+            y_offset=offset_y
+        )
+    
+    return geom_to_align
+
+
+# ============================================================================
+# EXAMPLE CONFIGURATIONS
+# ============================================================================
+
+# if __name__ == "__main__":
+#     from concreteproperties import (
+#         Concrete,
+#         ConcreteLinear,
+#         RectangularStressBlock,
+#         SteelBar,
+#         SteelElasticPlastic,
+#         Steel,
+#     )
+    
+#     # Define materials
+#     concrete = Concrete(
+#         name="40 MPa Concrete",
+#         density=2.4e-6,
+#         stress_strain_profile=ConcreteLinear(elastic_modulus=32.8e3),
+#         ultimate_stress_strain_profile=RectangularStressBlock(
+#             compressive_strength=40,
+#             alpha=0.79,
+#             gamma=0.87,
+#             ultimate_strain=0.003,
+#         ),
+#         flexural_tensile_strength=3.8,
+#         colour="lightgrey",
+#     )
+    
+#     steel_bar = SteelBar(
+#         name="500 MPa Steel",
+#         density=7.85e-6,
+#         stress_strain_profile=SteelElasticPlastic(
+#             yield_strength=500,
+#             elastic_modulus=200e3,
+#             fracture_strain=0.05,
+#         ),
+#         colour="grey",
+#     )
+    
+#     steel_structural = Steel(
+#         name="300 MPa Structural Steel",
+#         density=7.85e-6,
+#         stress_strain_profile=SteelElasticPlastic(
+#             yield_strength=300,
+#             elastic_modulus=200e3,
+#             fracture_strain=0.05,
+#         ),
+#         colour="tan",
+#     )
+    
+#     # Example 1: Simple hollow rectangular section
+#     print("=" * 70)
+#     print("Example 1: Hollow Rectangular Section")
+#     print("=" * 70)
+    
+#     section1 = create_dynamic_concrete_section(
+#         base_geometry_type="rectangular",
+#         base_geometry_params={"d": 600, "b": 400},
+#         base_material=concrete,
+#         holes=[{
+#             "type": "rectangular",
+#             "params": {"d": 400, "b": 200},
+#             "align": {"to": "center"}
+#         }],
+#         reinforcement=[{
+#             "type": "rectangular_array",
+#             "material": steel_bar,
+#             "params": {
+#                 "area": 310,
+#                 "n_x": 3,
+#                 "x_s": 150,
+#                 "n_y": 2,
+#                 "y_s": 520,
+#                 "anchor": (40, 40)
+#             }
+#         }],
+#         save_plot_path="output2/dynamic_section1.png",
+#         plot_title="Hollow Rectangular Section"
+#     )
+    
+#     # Example 2: Composite section (concrete with steel I-beam)
+#     print("\n" + "=" * 70)
+#     print("Example 2: Composite Section (Concrete + Steel I-Beam)")
+#     print("=" * 70)
+    
+#     section2 = create_dynamic_concrete_section(
+#         base_geometry_type="rectangular",
+#         base_geometry_params={"d": 500, "b": 500},
+#         base_material=concrete,
+#         additional_geometries=[{
+#             "type": "i_section",
+#             "params": {"d": 308, "b": 305, "t_f": 15.4, "t_w": 9.9, "r": 16.5, "n_r": 3},
+#             "material": steel_structural,
+#             "operation": "subtract",  # First subtract to make hole
+#             "align": {"to": "center"}
+#         }, {
+#             "type": "i_section",
+#             "params": {"d": 308, "b": 305, "t_f": 15.4, "t_w": 9.9, "r": 16.5, "n_r": 3},
+#             "material": steel_structural,
+#             "operation": "add",  # Then add with steel material
+#             "align": {"to": "center"}
+#         }],
+#         reinforcement=[{
+#             "type": "rectangular_array",
+#             "material": steel_bar,
+#             "params": {
+#                 "area": 310,
+#                 "n_x": 4,
+#                 "x_s": 132,
+#                 "n_y": 4,
+#                 "y_s": 132,
+#                 "anchor": (52, 52),
+#                 "exterior_only": True
+#             }
+#         }],
+#         save_plot_path="output2/dynamic_section2.png",
+#         plot_title="Composite Section"
+#     )
+    
+#     # Example 3: Circular section with circular bar array
+#     print("\n" + "=" * 70)
+#     print("Example 3: Circular Section with Circular Bar Array")
+#     print("=" * 70)
+    
+#     section3 = create_dynamic_concrete_section(
+#         base_geometry_type="circular",
+#         base_geometry_params={"d": 600, "n": 32},
+#         base_material=concrete,
+#         reinforcement=[{
+#             "type": "circular_array",
+#             "material": steel_bar,
+#             "params": {
+#                 "area": 310,
+#                 "n_bar": 10,
+#                 "r_array": 250
+#             }
+#         }],
+#         save_plot_path="output2/dynamic_section3.png",
+#         plot_title="Circular Section with Bar Array"
+#     )
+    
+#     # Example 4: L-shaped section
+#     print("\n" + "=" * 70)
+#     print("Example 4: L-Shaped Section")
+#     print("=" * 70)
+    
+#     section4 = create_dynamic_concrete_section(
+#         base_geometry_type="rectangular",
+#         base_geometry_params={"d": 150, "b": 800},
+#         base_material=concrete,
+#         additional_geometries=[{
+#             "type": "rectangular",
+#             "params": {"d": 600, "b": 300},
+#             "material": concrete,
+#             "operation": "add",
+#             "align": {"to": "previous", "on": "bottom", "inner": True}
+#         }],
+#         reinforcement=[{
+#             "type": "rectangular_array",
+#             "material": steel_bar,
+#             "params": {
+#                 "area": 310,
+#                 "n_x": 3,
+#                 "x_s": 120,
+#                 "n_y": 3,
+#                 "y_s": 200,
+#                 "anchor": (40, 40),
+#                 "exterior_only": True
+#             }
+#         }],
+#         save_plot_path="output2/dynamic_section4.png",
+#         plot_title="L-Shaped Section"
+#     )
+    
+#     print("\n" + "=" * 70)
+#     print("ALL DYNAMIC SECTIONS CREATED!")
+#     print("=" * 70)
 
 
 # ============================================================================
@@ -2347,7 +2796,3 @@ if __name__ == "__main__":
     print("  - Stress analyses (11 JSON + 11 plots)")
     print("\nTotal: 44 JSON files + 42 image files = 86 files!")
     print("\n" + "=" * 70)
-
-
-
-
