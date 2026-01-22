@@ -345,84 +345,290 @@ def generate_mesh(boundary_nodes, mesh_size, internal_points, voids,
     }
 
 
-def zero_element_boundary_condition(material_props, sections, node_list, 
-                                    boundary_condition, element_start_id, 
-                                    spring_node_start_id):
-    """Create zero-length elements at specified nodes"""
+def create_spring(spring_config):
+    import openseespy.opensees as ops
     
-    node_mapping = {}
-    element_ids = []
-    current_elem_id = element_start_id
-    current_spring_node_id = spring_node_start_id
+    results = []
     
-    try:
-        ops.uniaxialMaterial(*material_props['config'])
-    except:
-        pass
+    for config in spring_config:
+        node1_tuple = config["node1"]
+        spring_id = config["spring_id"]
+        direction = config["direction"]
+        material_type, mat_tag, K = config["material"]
+        boundary_condition = config["boundary_condition"]
+        
+        node1_tag, x, y, z = node1_tuple
+        spring_node = 100000 + spring_id
+        
+        ops.node(spring_node, x, y, z)
+        ops.fix(spring_node, *boundary_condition)
+        
+        ops.uniaxialMaterial(material_type, mat_tag, K)
+        ops.element("zeroLength", spring_id,
+                    node1_tag, spring_node,
+                    "-mat", mat_tag, "-dir", direction)
+        
+        results.append({"spring_id": spring_id, 
+                       "spring_node": spring_node, 
+                       "material_id": mat_tag})
     
-    for node_id, x, y, z in node_list:
-        spring_node_id = current_spring_node_id
+    return results
+
+
+
+
+def create_slab(slab_configs):
+    """Create multiple slabs with mesh, springs, loads, masses, boundary conditions"""
+    
+    all_meshes = []
+    all_springs = []
+    all_file_paths = {}
+    all_ops_commands = []  # NEW: Initialize command list
+    
+    for config in slab_configs:
+        slab_name = config['name']
         
-        ops.node(spring_node_id, x, y, z)
-        ops.fix(spring_node_id, *boundary_condition)
+        # Extract material properties
+        material_E = config['shell_material_config'][2]
+        material_nu = config['shell_material_config'][3]
+        material_rho = config['shell_material_config'][4]
+        thickness = config['shell_section_config'][3]
         
-        ops.element("zeroLength", current_elem_id, 
-                   node_id, spring_node_id, 
-                   "-mat", material_props['id'], 
-                   "-dir", *material_props['directions'])
+        # Generate mesh
+        mesh = generate_mesh(
+            boundary_nodes=config['boundary_nodes'],
+            mesh_size=config['mesh_size'],
+            internal_points=config.get('internal_points'),
+            voids=config.get('voids'),
+            py_file=config['py_file'],
+            png_file=config['png_file'],
+            material_E=material_E,
+            material_nu=material_nu,
+            material_rho=material_rho,
+            thickness=thickness,
+            node_font_size=config['node_font_size'],
+            element_font_size=config['element_font_size'],
+            start_node_id=config['start_node_id'],
+            start_element_id=config['start_element_id']
+        )
         
-        node_mapping[node_id] = {
-            'spring_node': spring_node_id,
-            'element_id': current_elem_id,
-            'main_coords': (x, y, z),
-            'spring_coords': (x, y, z)
-        }
+        mesh['config_name'] = slab_name
+        all_meshes.append(mesh)
+        all_file_paths[slab_name] = {'py_file': config['py_file'], 'png_file': config['png_file']}
         
-        element_ids.append(current_elem_id)
-        current_elem_id += 1
-        current_spring_node_id += 1
+        # Track all nodes and elements
+        all_node_ids = list(mesh['nodes'].keys())
+        quad4_element_tags = [elem['tag'] for elem in mesh['quad4']]
+        tri3_element_tags = [elem['tag'] for elem in mesh['tri3']]
+        
+        # Create OpenSees nodes
+        # node_coords = {}
+        # for node_id, coords in mesh['nodes'].items():
+        #     ops.node(node_id, *coords)
+        #     all_ops_commands.append(f"ops.node({node_id}, {coords[0]}, {coords[1]}, {coords[2]})")  # NEW
+        #     node_coords[node_id] = coords
+        # Create OpenSees nodes (skip if already exist)
+        node_coords = {}
+        existing_nodes = set(ops.getNodeTags())
+        for node_id, coords in mesh['nodes'].items():
+            if node_id not in existing_nodes:
+                ops.node(node_id, *coords)
+                all_ops_commands.append(f"ops.node({node_id}, {coords[0]}, {coords[1]}, {coords[2]})")
+            node_coords[node_id] = coords
+        
+        # Apply boundary conditions to ALL nodes
+        if config.get('shell_boundary_conditions'):
+            bc_dofs = config['shell_boundary_conditions']
+            for node_id in all_node_ids:
+                ops.fix(node_id, *bc_dofs)
+                all_ops_commands.append(f"ops.fix({node_id}, {', '.join(map(str, bc_dofs))})")  # NEW
+        
+        # Create springs for ALL nodes
+        if config.get('spring_configs'):
+            for spring_cfg in config['spring_configs']:
+                spring_id_start = spring_cfg['spring_id']
+                direction = spring_cfg['direction']
+                material_type, mat_tag, K = spring_cfg['material']
+                bc = spring_cfg['boundary_condition']
+                
+                spring_results = []
+                for i, node_id in enumerate(all_node_ids):
+                    x, y, z = mesh['nodes'][node_id]
+                    spring_node_id = spring_id_start + 100000 + i
+                    spring_elem_id = spring_id_start + i
+                    
+                    ops.node(spring_node_id, x, y, z)
+                    all_ops_commands.append(f"ops.node({spring_node_id}, {x}, {y}, {z})")  # NEW
+                    
+                    ops.fix(spring_node_id, *bc)
+                    all_ops_commands.append(f"ops.fix({spring_node_id}, {', '.join(map(str, bc))})")  # NEW
+                    
+                    ops.uniaxialMaterial(material_type, mat_tag + i, K)
+                    all_ops_commands.append(f"ops.uniaxialMaterial('{material_type}', {mat_tag + i}, {K})")  # NEW
+                    
+                    ops.element("zeroLength", spring_elem_id, node_id, spring_node_id, 
+                               "-mat", mat_tag + i, "-dir", direction)
+                    all_ops_commands.append(f"ops.element('zeroLength', {spring_elem_id}, {node_id}, {spring_node_id}, '-mat', {mat_tag + i}, '-dir', {direction})")  # NEW
+                    
+                    spring_results.append({
+                        'spring_id': spring_elem_id,
+                        'spring_node': spring_node_id,
+                        'material_id': mat_tag + i,
+                        'main_node': node_id
+                    })
+                
+                all_springs.extend(spring_results)
+        
+        # Create shell material and section
+        mat_id = config['shell_material_config'][1]
+        sec_id = config['shell_section_config'][1]
+        ops.nDMaterial('ElasticIsotropic', mat_id, material_E, material_nu, material_rho)
+        all_ops_commands.append(f"ops.nDMaterial('ElasticIsotropic', {mat_id}, {material_E}, {material_nu}, {material_rho})")  # NEW
+        
+        ops.section('PlateFiber', sec_id, mat_id, thickness)
+        all_ops_commands.append(f"ops.section('PlateFiber', {sec_id}, {mat_id}, {thickness})")  # NEW
+        
+        # Create shell elements
+        for elem in mesh['quad4']:
+            ops.element(config['ops_ele_type1'], elem['tag'], *elem['nodes'], sec_id)
+            all_ops_commands.append(f"ops.element('{config['ops_ele_type1']}', {elem['tag']}, {', '.join(map(str, elem['nodes']))}, {sec_id})")  # NEW
+        for elem in mesh['tri3']:
+            ops.element(config['ops_ele_type2'], elem['tag'], *elem['nodes'], sec_id)
+            all_ops_commands.append(f"ops.element('{config['ops_ele_type2']}', {elem['tag']}, {', '.join(map(str, elem['nodes']))}, {sec_id})")  # NEW
+        
+        # Apply loads to tracked elements
+        if config.get('load_configs'):
+            load_configs = config['load_configs']
+            
+            if 'time_series' in load_configs:
+                for ts in load_configs['time_series']:
+                    ops.timeSeries(ts['type'], ts['tag'])
+                    all_ops_commands.append(f"ops.timeSeries('{ts['type']}', {ts['tag']})")  # NEW
+            
+            if 'patterns' in load_configs:
+                for pattern in load_configs['patterns']:
+                    ops.pattern('Plain', pattern['tag'], pattern['ts_tag'])
+                    all_ops_commands.append(f"ops.pattern('Plain', {pattern['tag']}, {pattern['ts_tag']})")  # NEW
+            
+            if 'nodal_loads' in load_configs:
+                for load_group in load_configs['nodal_loads']:
+                    for load in load_group['loads']:
+                        ops.load(load['node'], *load['forces'])
+                        all_ops_commands.append(f"ops.load({load['node']}, {', '.join(map(str, load['forces']))})")  # NEW
+            
+            if 'shell_surface_loads' in load_configs:
+                for load_group in load_configs['shell_surface_loads']:
+                    for load in load_group['loads']:
+                        pressure = load['pressure']
+                        element_tags = load.get('elements')
+                        
+                        if element_tags is None:
+                            element_tags = quad4_element_tags + tri3_element_tags
+                        
+                        for etag in element_tags:
+                            opst.pre.transform_surface_uniform_load(ele_tags=[etag], p=pressure)
+                            all_ops_commands.append(f"opst.pre.transform_surface_uniform_load(ele_tags=[{etag}], p={pressure})")  # NEW
+        
+        # Apply masses to tracked elements
+        if config.get('mass_configs'):
+            mass_configs = config['mass_configs']
+            nodal_masses = {node_id: 0.0 for node_id in all_node_ids}
+            
+            if 'nodal_mass' in mass_configs:
+                for item in mass_configs['nodal_mass']:
+                    node_id = item['node']
+                    mass = item['mass']
+                    if node_id in nodal_masses:
+                        nodal_masses[node_id] += mass
+            
+            if 'shell_element_mass' in mass_configs:
+                for item in mass_configs['shell_element_mass']:
+                    element_tags = item.get('elements')
+                    mass_per_area = item['mass_per_area']
+                    
+                    if element_tags is None:
+                        element_tags = quad4_element_tags + tri3_element_tags
+                    
+                    shell_nodal_masses = _calculate_shell_mass_from_areas(
+                        ele_tags=element_tags,
+                        density=mass_per_area,
+                        thickness=1.0,
+                        opst=opst
+                    )
+                    
+                    for node_id, shell_mass in shell_nodal_masses.items():
+                        if node_id in nodal_masses:
+                            nodal_masses[node_id] += shell_mass
+            
+            # for node_id, mass_value in nodal_masses.items():
+            #     if mass_value > 0:
+            #         ops.mass(node_id, mass_value, mass_value, mass_value, 0.0, 0.0, 0.0)
+            #         all_ops_commands.append(f"ops.mass({node_id}, {mass_value}, {mass_value}, {mass_value}, 0.0, 0.0, 0.0)")  # NEW
     
     return {
-        'node_mapping': node_mapping,
-        'element_ids': element_ids,
-        'spring_node_ids': list(range(spring_node_start_id, current_spring_node_id)),
-        'total_elements': len(element_ids)
+        'meshes': all_meshes,
+        'springs': all_springs,
+        'file_paths': all_file_paths,
+        'ops_commands': all_ops_commands  # NEW: Return commands
     }
 
 
-def create_slab(boundary_nodes, mesh_size, internal_points, voids,
-                py_file, png_file, shell_material_config, shell_section_config,
-                node_font_size, element_font_size, ops_ele_type1, ops_ele_type2,
-                shell_boundary_conditions, use_zero_length, 
-                zero_length_material_config, zero_length_directions,
-                zero_length_boundary_conditions, element_start_id,
-                spring_node_start_id, load_configs, start_node_id, 
-                start_element_id):
-    """Create slab with mesh generation"""
+
+def load_saved_section(txt_path, png_path, pkl_path, display_commands, 
+                      display_image, return_section_object):
+    """Load saved section files"""
     
-    material_E = shell_material_config[2]
-    material_nu = shell_material_config[3]
-    material_rho = shell_material_config[4]
-    thickness = shell_section_config[3]
+    commands, fig, section = None, None, None
+    section_id = None
+    GJ_value = None
+    file_paths = {'txt': txt_path, 'png': png_path, 'pkl': pkl_path}
     
-    mesh = generate_mesh(
-        boundary_nodes=boundary_nodes,
-        mesh_size=mesh_size,
-        internal_points=internal_points,
-        voids=voids,
-        py_file=py_file,
-        png_file=png_file,
-        material_E=material_E,
-        material_nu=material_nu,
-        material_rho=material_rho,
-        thickness=thickness,
-        node_font_size=node_font_size,
-        element_font_size=element_font_size,
-        start_node_id=start_node_id,
-        start_element_id=start_element_id
-    )
+    if txt_path:
+        if txt_path.endswith('.py'):
+            params_file = txt_path.replace('.py', '_params.txt')
+        else:
+            params_file = txt_path + '_params.txt'
+        
+        try:
+            with open(params_file, 'r') as f:
+                for line in f:
+                    if line.startswith('section_tag'):
+                        section_id = int(line.split('=')[1].strip())
+                    elif line.startswith('GJ'):
+                        GJ_value = float(line.split('=')[1].strip())
+        except:
+            pass
     
-    return mesh
+    if txt_path:
+        try:
+            with open(txt_path, 'r') as f:
+                commands = f.read()
+            if display_commands:
+                print(commands)
+        except Exception as e:
+            print(f"Error loading {txt_path}: {e}")
+    
+    if png_path and display_image:
+        try:
+            img = plt.imread(png_path)
+            fig, ax = plt.subplots(figsize=(10, 10))
+            ax.imshow(img)
+            ax.axis('off')
+            ax.set_title(f'Loaded from: {png_path}', fontsize=12)
+            plt.tight_layout()
+            plt.show()
+        except Exception as e:
+            print(f"Error loading {png_path}: {e}")
+    
+    if pkl_path and return_section_object:
+        try:
+            with open(pkl_path, 'rb') as f:
+                section = pickle.load(f)
+        except Exception as e:
+            print(f"Error loading {pkl_path}: {e}")
+    
+    return commands, fig, section, section_id, GJ_value, file_paths
+
 
 
 def create_dynamic_composite_section(
@@ -598,101 +804,241 @@ def create_dynamic_composite_section(
     return SEC, sec_tag, save_txt_path, save_png_path, save_pkl_path, params_file
 
 
-def load_saved_section(txt_path, png_path, pkl_path, display_commands, 
-                      display_image, return_section_object):
-    """Load saved section files"""
+def create_fiber_section(fiber_configs):
+    """
+    Create and save fiber section from configuration dictionary.
     
-    commands, fig, section = None, None, None
-    section_id = None
-    GJ_value = None
-    file_paths = {'txt': txt_path, 'png': png_path, 'pkl': pkl_path}
+    Parameters
+    ----------
+    fiber_configs : dict
+        Dictionary containing all section parameters. Required keys:
+        - materials, outline_points, core_material, mesh_sizes, ops_mat_tags,
+          sec_tag, G, save_prefix, section_name
+        Optional keys:
+        - cover_thickness, cover_material, rebar_configs, steel_material,
+          core_holes, voids, bone_geometry, additional_patches,
+          display_results, plot_section
     
-    if txt_path:
-        if txt_path.endswith('.py'):
-            params_file = txt_path.replace('.py', '_params.txt')
-        else:
-            params_file = txt_path + '_params.txt'
-        
-        try:
-            with open(params_file, 'r') as f:
-                for line in f:
-                    if line.startswith('section_tag'):
-                        section_id = int(line.split('=')[1].strip())
-                    elif line.startswith('GJ'):
-                        GJ_value = float(line.split('=')[1].strip())
-        except:
-            pass
+    Returns
+    -------
+    tuple
+        (sec_id, txt_path, png_path, pkl_path, params_path)
+    """
+    # Extract save prefix for file paths
+    save_prefix = fiber_configs['save_prefix']
     
-    if txt_path:
-        try:
-            with open(txt_path, 'r') as f:
-                commands = f.read()
-            if display_commands:
-                print(commands)
-        except Exception as e:
-            print(f"Error loading {txt_path}: {e}")
+    # Get mesh sizes - handle both simple and complex formats
+    mesh_sizes = fiber_configs['mesh_sizes']
+    if isinstance(mesh_sizes, (int, float)):
+        # Simple format: single mesh size for cover and core
+        mesh_dict = {'cover': mesh_sizes, 'core': mesh_sizes}
+    elif isinstance(mesh_sizes, dict):
+        # Complex format: dictionary with all patch mesh sizes
+        mesh_dict = mesh_sizes
+    else:
+        raise ValueError("mesh_sizes must be a number or dictionary")
     
-    if png_path and display_image:
-        try:
-            img = plt.imread(png_path)
-            fig, ax = plt.subplots(figsize=(10, 10))
-            ax.imshow(img)
-            ax.axis('off')
-            ax.set_title(f'Loaded from: {png_path}', fontsize=12)
-            plt.tight_layout()
-            plt.show()
-        except Exception as e:
-            print(f"Error loading {png_path}: {e}")
-    
-    if pkl_path and return_section_object:
-        try:
-            with open(pkl_path, 'rb') as f:
-                section = pickle.load(f)
-        except Exception as e:
-            print(f"Error loading {pkl_path}: {e}")
-    
-    return commands, fig, section, section_id, GJ_value, file_paths
-
-
-def create_fiber_section(materials, outline_points, cover, rebar_configs, mesh_size, 
-                         mat_tags, sec_tag, G, save_prefix, section_name):
-    """Create and save fiber section"""
     SEC, sec_id, txt_path, png_path, pkl_path, params_path = create_dynamic_composite_section(
-        materials=materials,
-        outline_points=outline_points,
-        cover_thickness=cover,
-        cover_material='concrete_cover',
-        core_material='concrete_core',
-        mesh_sizes={'cover': mesh_size, 'core': mesh_size},
-        ops_mat_tags=mat_tags,
-        rebar_configs=rebar_configs,
-        steel_material='steel_rebar',
-        sec_tag=sec_tag,
-        G=G,
+        materials=fiber_configs['materials'],
+        outline_points=fiber_configs['outline_points'],
+        cover_thickness=fiber_configs.get('cover_thickness'),
+        cover_material=fiber_configs.get('cover_material', 'concrete_cover'),
+        core_material=fiber_configs['core_material'],
+        mesh_sizes=mesh_dict,
+        ops_mat_tags=fiber_configs['ops_mat_tags'],
+        rebar_configs=fiber_configs.get('rebar_configs'),
+        steel_material=fiber_configs.get('steel_material', 'steel_rebar'),
+        sec_tag=fiber_configs['sec_tag'],
+        G=fiber_configs['G'],
         save_txt_path=f'{save_prefix}_commands.py',
         save_png_path=f'{save_prefix}_figure.png',
         save_pkl_path=f'{save_prefix}_object.pkl',
-        section_name=section_name,
-        display_results=False,
-        plot_section=False,
-        core_holes=None,
-        voids=None,
-        bone_geometry=None,
-        additional_patches=None
+        section_name=fiber_configs['section_name'],
+        display_results=fiber_configs.get('display_results', False),
+        plot_section=fiber_configs.get('plot_section', False),
+        core_holes=fiber_configs.get('core_holes'),
+        voids=fiber_configs.get('voids'),
+        bone_geometry=fiber_configs.get('bone_geometry'),
+        additional_patches=fiber_configs.get('additional_patches')
     )
-    return sec_id, txt_path, png_path, pkl_path
+    return sec_id, txt_path, png_path, pkl_path, params_path
 
-
-def define_uniaxial_materials(material_params):
-    """Define OpenSees uniaxial materials"""
-    for param in material_params:
-        ops.uniaxialMaterial(*param)
-
-
-def create_nodes(node_coords):
-    """Create nodes"""
-    for node_id, coords in node_coords.items():
-        ops.node(node_id, *coords)
+def create_member_element(member_element_config):
+    import openseespy.opensees as ops
+    
+    results = []
+    
+    # Create all sections
+    if 'section' in member_element_config:
+        print("# Sections")
+        for sec_config in member_element_config['section']:
+            sec_type = sec_config['type']
+            sec_tag = sec_config['secTag']
+            
+            if sec_type == 'Elastic':
+                E_mod = sec_config['E']
+                A = sec_config['A']
+                Iz = sec_config['Iz']
+                
+                # Check if 3D section
+                if 'Iy' in sec_config and 'G' in sec_config and 'J' in sec_config:
+                    # 3D section
+                    Iy = sec_config['Iy']
+                    G_mod = sec_config['G']
+                    Jxx = sec_config['J']
+                    alphaY = sec_config.get('alphaY', None)
+                    alphaZ = sec_config.get('alphaZ', None)
+                    
+                    if alphaY is not None and alphaZ is not None:
+                        ops.section('Elastic', sec_tag, E_mod, A, Iz, Iy, G_mod, Jxx, alphaY, alphaZ)
+                        results.append(f"ops.section('Elastic', {sec_tag}, {E_mod}, {A}, {Iz}, {Iy}, {G_mod}, {Jxx}, {alphaY}, {alphaZ})")
+                    elif alphaY is not None:
+                        ops.section('Elastic', sec_tag, E_mod, A, Iz, Iy, G_mod, Jxx, alphaY)
+                        results.append(f"ops.section('Elastic', {sec_tag}, {E_mod}, {A}, {Iz}, {Iy}, {G_mod}, {Jxx}, {alphaY})")
+                    else:
+                        ops.section('Elastic', sec_tag, E_mod, A, Iz, Iy, G_mod, Jxx)
+                        results.append(f"ops.section('Elastic', {sec_tag}, {E_mod}, {A}, {Iz}, {Iy}, {G_mod}, {Jxx})")
+                else:
+                    # 2D section
+                    G_mod = sec_config.get('G', None)
+                    alphaY = sec_config.get('alphaY', None)
+                    
+                    if G_mod is not None and alphaY is not None:
+                        ops.section('Elastic', sec_tag, E_mod, A, Iz, G_mod, alphaY)
+                        results.append(f"ops.section('Elastic', {sec_tag}, {E_mod}, {A}, {Iz}, {G_mod}, {alphaY})")
+                    elif G_mod is not None:
+                        ops.section('Elastic', sec_tag, E_mod, A, Iz, G_mod)
+                        results.append(f"ops.section('Elastic', {sec_tag}, {E_mod}, {A}, {Iz}, {G_mod})")
+                    else:
+                        ops.section('Elastic', sec_tag, E_mod, A, Iz)
+                        results.append(f"ops.section('Elastic', {sec_tag}, {E_mod}, {A}, {Iz})")
+                
+                print(results[-1])
+    
+    # Create all geometric transformations
+    if 'geomTransf' in member_element_config:
+        print("\n# Geometric Transformations")
+        for transf_config in member_element_config['geomTransf']:
+            transf_type = transf_config['type']
+            transf_tag = transf_config['tag']
+            
+            if transf_type == 'Linear':
+                if 'vecxz' in transf_config:
+                    ops.geomTransf('Linear', transf_tag, *transf_config['vecxz'])
+                    results.append(f"ops.geomTransf('Linear', {transf_tag}, *{transf_config['vecxz']})")
+                else:
+                    ops.geomTransf('Linear', transf_tag)
+                    results.append(f"ops.geomTransf('Linear', {transf_tag})")
+            
+            elif transf_type == 'PDelta':
+                if 'vecxz' in transf_config:
+                    ops.geomTransf('PDelta', transf_tag, *transf_config['vecxz'])
+                    results.append(f"ops.geomTransf('PDelta', {transf_tag}, *{transf_config['vecxz']})")
+                else:
+                    ops.geomTransf('PDelta', transf_tag)
+                    results.append(f"ops.geomTransf('PDelta', {transf_tag})")
+            
+            elif transf_type == 'Corotational':
+                if 'vecxz' in transf_config:
+                    ops.geomTransf('Corotational', transf_tag, *transf_config['vecxz'])
+                    results.append(f"ops.geomTransf('Corotational', {transf_tag}, *{transf_config['vecxz']})")
+                else:
+                    ops.geomTransf('Corotational', transf_tag)
+                    results.append(f"ops.geomTransf('Corotational', {transf_tag})")
+            
+            print(results[-1])
+    
+    # Create all beam integrations
+    if 'beamIntegration' in member_element_config:
+        print("\n# Beam Integration")
+        for integ_config in member_element_config['beamIntegration']:
+            integ_type = integ_config['type']
+            integ_tag = integ_config['tag']
+            
+            if integ_type in ['Lobatto', 'Legendre', 'NewtonCotes', 'Radau', 'Trapezoidal', 'CompositeSimpson']:
+                ops.beamIntegration(integ_type, integ_tag, integ_config['secTag'], integ_config['N'])
+                results.append(f"ops.beamIntegration('{integ_type}', {integ_tag}, {integ_config['secTag']}, {integ_config['N']})")
+            
+            elif integ_type == 'UserDefined':
+                ops.beamIntegration('UserDefined', integ_tag, integ_config['N'], 
+                                  *integ_config['secTags'], *integ_config['locs'], *integ_config['wts'])
+                results.append(f"ops.beamIntegration('UserDefined', {integ_tag}, {integ_config['N']}, *{integ_config['secTags']}, *{integ_config['locs']}, *{integ_config['wts']})")
+            
+            elif integ_type == 'FixedLocation':
+                ops.beamIntegration('FixedLocation', integ_tag, integ_config['N'], 
+                                  *integ_config['secTags'], *integ_config['locs'])
+                results.append(f"ops.beamIntegration('FixedLocation', {integ_tag}, {integ_config['N']}, *{integ_config['secTags']}, *{integ_config['locs']})")
+            
+            elif integ_type == 'LowOrder':
+                ops.beamIntegration('LowOrder', integ_tag, integ_config['N'], *integ_config['secTags'])
+                results.append(f"ops.beamIntegration('LowOrder', {integ_tag}, {integ_config['N']}, *{integ_config['secTags']})")
+            
+            elif integ_type == 'MidDistance':
+                ops.beamIntegration('MidDistance', integ_tag, integ_config['N'], 
+                                  *integ_config['secTags'], *integ_config['locs'])
+                results.append(f"ops.beamIntegration('MidDistance', {integ_tag}, {integ_config['N']}, *{integ_config['secTags']}, *{integ_config['locs']})")
+            
+            print(results[-1])
+    
+    # Create all elements
+    if 'element' in member_element_config:
+        print("\n# Elements")
+        for elem_config in member_element_config['element']:
+            element_type = elem_config['type']
+            ele_tag = elem_config['eleTag']
+            ele_nodes = elem_config['eleNodes']
+            transf_tag = elem_config['transfTag']
+            
+            if element_type == 'elasticBeamColumn':
+                if 'secTag' in elem_config:
+                    ops.element('elasticBeamColumn', ele_tag, *ele_nodes, elem_config['secTag'], transf_tag)
+                    results.append(f"ops.element('elasticBeamColumn', {ele_tag}, *{ele_nodes}, {elem_config['secTag']}, {transf_tag})")
+                else:
+                    if 'G' in elem_config:
+                        ops.element('elasticBeamColumn', ele_tag, *ele_nodes,
+                                   elem_config['Area'], elem_config['E'], elem_config['G'],
+                                   elem_config['J'], elem_config['Iy'], elem_config['Iz'], transf_tag)
+                        results.append(f"ops.element('elasticBeamColumn', {ele_tag}, *{ele_nodes}, {elem_config['Area']}, {elem_config['E']}, {elem_config['G']}, {elem_config['J']}, {elem_config['Iy']}, {elem_config['Iz']}, {transf_tag})")
+                    else:
+                        ops.element('elasticBeamColumn', ele_tag, *ele_nodes,
+                                   elem_config['Area'], elem_config['E'], elem_config['Iz'], transf_tag)
+                        results.append(f"ops.element('elasticBeamColumn', {ele_tag}, *{ele_nodes}, {elem_config['Area']}, {elem_config['E']}, {elem_config['Iz']}, {transf_tag})")
+            
+            elif element_type == 'ModElasticBeam2d':
+                ops.element('ModElasticBeam2d', ele_tag, *ele_nodes,
+                           elem_config['Area'], elem_config['E'], elem_config['Iz'],
+                           elem_config['K11'], elem_config['K33'], elem_config['K44'], transf_tag)
+                results.append(f"ops.element('ModElasticBeam2d', {ele_tag}, *{ele_nodes}, {elem_config['Area']}, {elem_config['E']}, {elem_config['Iz']}, {elem_config['K11']}, {elem_config['K33']}, {elem_config['K44']}, {transf_tag})")
+            
+            elif element_type == 'ElasticTimoshenkoBeam':
+                if 'Avz' in elem_config:
+                    ops.element('ElasticTimoshenkoBeam', ele_tag, *ele_nodes,
+                               elem_config['E'], elem_config['G'], elem_config['Area'],
+                               elem_config['J'], elem_config['Iy'], elem_config['Iz'],
+                               elem_config['Avy'], elem_config['Avz'], transf_tag)
+                    results.append(f"ops.element('ElasticTimoshenkoBeam', {ele_tag}, *{ele_nodes}, {elem_config['E']}, {elem_config['G']}, {elem_config['Area']}, {elem_config['J']}, {elem_config['Iy']}, {elem_config['Iz']}, {elem_config['Avy']}, {elem_config['Avz']}, {transf_tag})")
+                else:
+                    ops.element('ElasticTimoshenkoBeam', ele_tag, *ele_nodes,
+                               elem_config['E'], elem_config['G'], elem_config['Area'],
+                               elem_config['Iz'], elem_config['Avy'], transf_tag)
+                    results.append(f"ops.element('ElasticTimoshenkoBeam', {ele_tag}, *{ele_nodes}, {elem_config['E']}, {elem_config['G']}, {elem_config['Area']}, {elem_config['Iz']}, {elem_config['Avy']}, {transf_tag})")
+            
+            elif element_type == 'dispBeamColumn':
+                ops.element('dispBeamColumn', ele_tag, *ele_nodes, transf_tag, elem_config['integrationTag'])
+                results.append(f"ops.element('dispBeamColumn', {ele_tag}, *{ele_nodes}, {transf_tag}, {elem_config['integrationTag']})")
+            
+            elif element_type == 'forceBeamColumn':
+                ops.element('forceBeamColumn', ele_tag, *ele_nodes, transf_tag, elem_config['integrationTag'])
+                results.append(f"ops.element('forceBeamColumn', {ele_tag}, *{ele_nodes}, {transf_tag}, {elem_config['integrationTag']})")
+            
+            elif element_type == 'nonlinearBeamColumn':
+                ops.element('nonlinearBeamColumn', ele_tag, *ele_nodes,
+                           elem_config['numIntgrPts'], elem_config['secTag'], transf_tag)
+                results.append(f"ops.element('nonlinearBeamColumn', {ele_tag}, *{ele_nodes}, {elem_config['numIntgrPts']}, {elem_config['secTag']}, {transf_tag})")
+            
+            print(results[-1])
+    
+    return results
 
 
 def apply_boundary_conditions(boundary_conditions):
@@ -701,39 +1047,8 @@ def apply_boundary_conditions(boundary_conditions):
         ops.fix(node_id, *dofs)
 
 
-def create_rigid_diaphragms(diaphragm_list):
-    """Create rigid diaphragm constraints"""
-    for perp_dir, ret_node, *constr_nodes in diaphragm_list:
-        ops.rigidDiaphragm(perp_dir, ret_node, *constr_nodes)
-
-
-def create_elements(element_configs):
-    """Create transformations, integrations, elastic sections, and elements"""
-    
-    for transf in element_configs.get('transformations', []):
-        ops.geomTransf(transf['type'], transf['tag'], *transf['vecxz'])
-    
-    for integ in element_configs.get('integrations', []):
-        ops.beamIntegration(integ['type'], integ['tag'], integ['sec_tag'], integ['np'])
-    
-    for elastic_sec in element_configs.get('elastic_sections', []):
-        ops.section("Elastic", elastic_sec['sec_tag'], elastic_sec['E'],
-                   elastic_sec['A'], elastic_sec['Iz'], elastic_sec['Iy'],
-                   elastic_sec['G'], elastic_sec['J'])
-    
-    for col in element_configs.get('force_beam_columns', []):
-        ops.element("forceBeamColumn", col['tag'], col['node_i'], col['node_j'], 
-                    col['transf_tag'], col['integ_tag'])
-    
-    for beam in element_configs.get('elastic_beam_columns', []):
-        ops.element("elasticBeamColumn", beam['tag'], beam['node_i'], beam['node_j'],
-                    beam['A'], beam['E'], beam['G'], beam['J'], 
-                    beam['Iy'], beam['Iz'], beam['transf_tag'])
-
-
 def apply_loads_and_masses(load_configs, mass_configs, shell_meshes, 
                            slab_configs, element_configs, node_coords):
-    """Apply all loads and masses - all parameters required"""
     
     if load_configs is None and mass_configs is None:
         raise ValueError("Both load_configs and mass_configs are None")
@@ -744,20 +1059,17 @@ def apply_loads_and_masses(load_configs, mass_configs, shell_meshes,
     if node_coords is None:
         raise ValueError("node_coords required")
     
-    try:
-        import opstool as opst
-        has_opstool = True
-    except ImportError:
-        opst = None
-        has_opstool = False
+    import opstool as opst
+    from collections import defaultdict  # ✅ ADD THIS IMPORT
     
     results = {
         'nodal_masses': {},
         'load_summary': {},
-        'mass_summary': {}
+        'mass_summary': {},
+        'load_commands': [],
+        'mass_commands': []
     }
     
-    # Apply loads
     if load_configs is not None:
         print("\nApplying loads...")
         
@@ -768,46 +1080,57 @@ def apply_loads_and_masses(load_configs, mass_configs, shell_meshes,
                 
                 if ts_type == 'Linear':
                     ops.timeSeries('Linear', tag)
+                    results['load_commands'].append(f"ops.timeSeries('Linear', {tag})")
                 elif ts_type == 'Constant':
                     ops.timeSeries('Constant', tag)
+                    results['load_commands'].append(f"ops.timeSeries('Constant', {tag})")
                 elif ts_type == 'Trig':
                     ops.timeSeries('Trig', tag, ts['tStart'], ts['tEnd'], ts['period'])
+                    results['load_commands'].append(f"ops.timeSeries('Trig', {tag}, {ts['tStart']}, {ts['tEnd']}, {ts['period']})")
             
             results['load_summary']['time_series'] = len(load_configs['time_series'])
         
         if 'patterns' in load_configs:
             for pattern in load_configs['patterns']:
                 ops.pattern('Plain', pattern['tag'], pattern['ts_tag'])
+                results['load_commands'].append(f"ops.pattern('Plain', {pattern['tag']}, {pattern['ts_tag']})")
             
             results['load_summary']['patterns'] = len(load_configs['patterns'])
         
         if 'nodal_loads' in load_configs:
-            total_nodal_loads = 0
+            # ACCUMULATE loads first, then apply once
+            accumulated_loads = defaultdict(lambda: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            
             for load_group in load_configs['nodal_loads']:
                 for load in load_group['loads']:
-                    ops.load(load['node'], *load['forces'])
-                    total_nodal_loads += 1
+                    node_id = load['node']
+                    forces = load['forces']
+                    for i in range(6):
+                        accumulated_loads[node_id][i] += forces[i]
+            
+            # Now apply accumulated loads
+            total_nodal_loads = 0
+            for node_id, forces in accumulated_loads.items():
+                ops.load(node_id, *forces)
+                forces_str = ', '.join(map(str, forces))
+                results['load_commands'].append(f"ops.load({node_id}, {forces_str})")
+                total_nodal_loads += 1
             
             results['load_summary']['nodal_loads'] = total_nodal_loads
         
         if 'beam_uniform_loads' in load_configs:
-            if not has_opstool:
-                raise ImportError("opstool required for beam_uniform_loads")
-            
             total_beam_uniform = 0
             for load_group in load_configs['beam_uniform_loads']:
                 for load in load_group['loads']:
                     opst.pre.transform_beam_uniform_load(load['elements'], 
                                                         wy=load['wy'], 
                                                         wz=load['wz'])
+                    results['load_commands'].append(f"opst.pre.transform_beam_uniform_load({load['elements']}, wy={load['wy']}, wz={load['wz']})")
                     total_beam_uniform += len(load['elements'])
             
             results['load_summary']['beam_uniform_loads'] = total_beam_uniform
         
         if 'beam_point_loads' in load_configs:
-            if not has_opstool:
-                raise ImportError("opstool required for beam_point_loads")
-            
             total_beam_point = 0
             for load_group in load_configs['beam_point_loads']:
                 for load in load_group['loads']:
@@ -815,14 +1138,12 @@ def apply_loads_and_masses(load_configs, mass_configs, shell_meshes,
                                                        py=load['py'], 
                                                        pz=load['pz'], 
                                                        xl=load['xl'])
+                    results['load_commands'].append(f"opst.pre.transform_beam_point_load([{load['element']}], py={load['py']}, pz={load['pz']}, xl={load['xl']})")
                     total_beam_point += 1
             
             results['load_summary']['beam_point_loads'] = total_beam_point
         
         if 'shell_surface_loads' in load_configs:
-            if not has_opstool:
-                raise ImportError("opstool required for shell_surface_loads")
-            
             if not shell_meshes:
                 raise ValueError("shell_meshes required for shell_surface_loads")
             
@@ -849,13 +1170,13 @@ def apply_loads_and_masses(load_configs, mass_configs, shell_meshes,
                         element_tags = specific_elements
                     
                     opst.pre.transform_surface_uniform_load(ele_tags=element_tags, p=pressure)
+                    results['load_commands'].append(f"opst.pre.transform_surface_uniform_load(ele_tags={element_tags}, p={pressure})")
                     total_shell_loads += len(element_tags)
             
             results['load_summary']['shell_surface_loads'] = total_shell_loads
         
         print("Loads applied")
     
-    # Apply masses
     if mass_configs is not None:
         print("\nApplying masses...")
         
@@ -878,18 +1199,18 @@ def apply_loads_and_masses(load_configs, mass_configs, shell_meshes,
                 element_found = False
                 node_i, node_j = None, None
                 
-                for col in element_configs['force_beam_columns']:
-                    if col['tag'] == tag:
-                        node_i, node_j = col['node_i'], col['node_j']
-                        element_found = True
-                        break
-                
-                if not element_found:
-                    for beam in element_configs['elastic_beam_columns']:
-                        if beam['tag'] == tag:
-                            node_i, node_j = beam['node_i'], beam['node_j']
+                # Find element nodes from element_configs['element']
+                ele_nodes = None
+                if 'element' in element_configs:
+                    for elem_config in element_configs['element']:
+                        if elem_config['eleTag'] == tag:
+                            ele_nodes = elem_config['eleNodes']
                             element_found = True
                             break
+                
+                if ele_nodes is not None:
+                    node_i, node_j = ele_nodes[0], ele_nodes[1]
+                    
                 
                 if not element_found:
                     raise ValueError(f"Element {tag} not found")
@@ -913,47 +1234,38 @@ def apply_loads_and_masses(load_configs, mass_configs, shell_meshes,
             
             results['mass_summary']['beam_column_mass'] = beam_col_mass_applied
         
-        # ==================================================================
-        # NEW: Additional beam distributed mass
-        # ==================================================================
         if 'beam_additional_mass' in mass_configs:
             print("\nApplying additional beam masses...")
             total_beam_additional_mass = 0.0
             
             for item in mass_configs['beam_additional_mass']:
                 element_tags = item['element_tags']
-                mass_per_length = item['mass_per_length']  # kips/ft
+                mass_per_length = item['mass_per_length']
                 description = item.get('description', 'Additional beam mass')
                 
                 for etag in element_tags:
-                    # Find element nodes
                     node_i, node_j = None, None
                     element_found = False
                     
-                    # Search in force beam columns
-                    for col in element_configs['force_beam_columns']:
-                        if col['tag'] == etag:
-                            node_i, node_j = col['node_i'], col['node_j']
-                            element_found = True
-                            break
-                    
-                    # Search in elastic beam columns
-                    if not element_found:
-                        for beam in element_configs['elastic_beam_columns']:
-                            if beam['tag'] == etag:
-                                node_i, node_j = beam['node_i'], beam['node_j']
+                    # Find element nodes from element_configs['element']
+                    ele_nodes = None
+                    if 'element' in element_configs:
+                        for elem_config in element_configs['element']:
+                            if elem_config['eleTag'] == etag:  # ✅ FIXED: 'etag' not 'tag'
+                                ele_nodes = elem_config['eleNodes']
                                 element_found = True
                                 break
+                    
+                    if ele_nodes is not None:
+                        node_i, node_j = ele_nodes[0], ele_nodes[1]
                     
                     if not element_found:
                         raise ValueError(f"Element {etag} not found for beam mass")
                     
-                    # Calculate element length
                     xi, yi, zi = node_coords[node_i]
                     xj, yj, zj = node_coords[node_j]
                     length = ((xj-xi)**2 + (yj-yi)**2 + (zj-zi)**2)**0.5
                     
-                    # Calculate total mass and distribute to nodes
                     total_mass = mass_per_length * length
                     half_mass = total_mass / 2.0
                     
@@ -969,7 +1281,6 @@ def apply_loads_and_masses(load_configs, mass_configs, shell_meshes,
             
             results['mass_summary']['beam_additional_mass'] = total_beam_additional_mass
             print(f"Applied {total_beam_additional_mass:.2f} kips additional beam mass")
-    
         
         if 'nodal_mass' in mass_configs:
             node_mass_groups = defaultdict(list)
@@ -993,9 +1304,6 @@ def apply_loads_and_masses(load_configs, mass_configs, shell_meshes,
             shell_config = mass_configs['shell_mass']
             
             if shell_config['calculate']:
-                if not has_opstool:
-                    raise ImportError("opstool required for shell mass calculation")
-                
                 if not shell_meshes:
                     raise ValueError("shell_meshes required when calculate=True")
                 
@@ -1049,27 +1357,20 @@ def apply_loads_and_masses(load_configs, mass_configs, shell_meshes,
                 
                 results['mass_summary']['shell_mass_total'] = total_shell_mass_applied
 
-        # ==================================================================
-        # NEW: Additional shell distributed mass
-        # ==================================================================
         if 'shell_additional_mass' in mass_configs:
             print("\nApplying additional shell masses...")
             
             if not shell_meshes:
                 raise ValueError("shell_meshes required for shell_additional_mass")
             
-            if not has_opstool:
-                raise ImportError("opstool required for shell mass calculation")
-            
             total_shell_additional_mass = 0.0
             
             for item in mass_configs['shell_additional_mass']:
                 mesh_name = item['mesh_name']
-                mass_per_area = item['mass_per_area']  # kips/sf
+                mass_per_area = item['mass_per_area']
                 specific_elements = item.get('element_tags', None)
                 description = item.get('description', 'Additional shell mass')
                 
-                # Find the target mesh
                 target_mesh = None
                 for mesh in shell_meshes:
                     if mesh.get('config_name') == mesh_name:
@@ -1079,22 +1380,19 @@ def apply_loads_and_masses(load_configs, mass_configs, shell_meshes,
                 if target_mesh is None:
                     raise ValueError(f"Mesh '{mesh_name}' not found")
                 
-                # Get element tags
                 if specific_elements is None:
                     shell_ele_tags = [elem['tag'] for elem in target_mesh['quad4']]
                     shell_ele_tags += [elem['tag'] for elem in target_mesh['tri3']]
                 else:
                     shell_ele_tags = specific_elements
                 
-                # Calculate nodal masses from element areas
                 shell_nodal_masses = _calculate_shell_mass_from_areas(
                     ele_tags=shell_ele_tags,
-                    density=mass_per_area,  # Already in kips/sf
-                    thickness=1.0,  # Thickness = 1.0 since density is already mass/area
+                    density=mass_per_area,
+                    thickness=1.0,
                     opst=opst
                 )
                 
-                # Add to total nodal masses
                 mesh_total_mass = 0.0
                 for node_id, shell_mass in shell_nodal_masses.items():
                     if node_id not in nodal_masses:
@@ -1108,16 +1406,57 @@ def apply_loads_and_masses(load_configs, mass_configs, shell_meshes,
             
             results['mass_summary']['shell_additional_mass'] = total_shell_additional_mass
             print(f"Applied {total_shell_additional_mass:.2f} kips total additional shell mass")
-    
         
+        # ACCUMULATE all mass contributions from ALL sources
+        accumulated_masses = defaultdict(float)
+        
+        # 1. Add masses from nodal_masses dict (from beams, shells, etc)
+        for node_id, mass_value in nodal_masses.items():
+            accumulated_masses[node_id] += mass_value
+        
+        # 2. Add masses from shell meshes that were calculated in create_slab
+        if shell_meshes:
+            for shell_mesh in shell_meshes:
+                # Get the mass config from the corresponding slab_config
+                mesh_name = shell_mesh.get('config_name', 'Unknown')
+                for cfg in slab_configs:
+                    if cfg.get('name') == mesh_name:
+                        if 'mass_configs' in cfg:
+                            # Recalculate shell masses (they weren't applied in create_slab)
+                            if 'shell_element_mass' in cfg['mass_configs']:
+                                for item in cfg['mass_configs']['shell_element_mass']:
+                                    element_tags = item.get('elements')
+                                    mass_per_area = item['mass_per_area']
+                                    
+                                    if element_tags is None:
+                                        element_tags = [elem['tag'] for elem in shell_mesh['quad4'] + shell_mesh['tri3']]
+                                    
+                                    # Get section config to find thickness
+                                    sec_config = cfg['shell_section_config']
+                                    thickness = sec_config[3]
+                                    
+                                    shell_nodal_masses = _calculate_shell_mass_from_areas(
+                                        ele_tags=element_tags,
+                                        density=mass_per_area,
+                                        thickness=1.0,
+                                        opst=opst
+                                    )
+                                    
+                                    for node_id, shell_mass in shell_nodal_masses.items():
+                                        accumulated_masses[node_id] += shell_mass
+        
+        # NOW assign all masses ONCE
         nodes_with_mass = 0
         total_mass_applied = 0.0
         
-        for node_id, mass_value in nodal_masses.items():
-            if mass_value > 0:
-                ops.mass(node_id, mass_value, mass_value, mass_value, 0.0, 0.0, 0.0)
+        for node_id, total_mass_value in accumulated_masses.items():
+            if total_mass_value > 0:
+                ops.mass(node_id, total_mass_value, total_mass_value, total_mass_value, 0.0, 0.0, 0.0)
+                results['mass_commands'].append(f"ops.mass({node_id}, {total_mass_value}, {total_mass_value}, {total_mass_value}, 0.0, 0.0, 0.0)")
                 nodes_with_mass += 1
-                total_mass_applied += mass_value
+                total_mass_applied += total_mass_value
+        
+        results['nodal_masses'] = dict(accumulated_masses)
         
         results['nodal_masses'] = nodal_masses
         results['mass_summary']['nodes_with_mass'] = nodes_with_mass
@@ -1126,7 +1465,6 @@ def apply_loads_and_masses(load_configs, mass_configs, shell_meshes,
         print("Masses applied")
     
     return results
-
 
 def _compute_tri_area_and_normal(vertices):
     """Compute area and normal of triangle"""
@@ -1175,13 +1513,11 @@ def _calculate_shell_mass_from_areas(ele_tags, density, thickness, opst):
     return dict(nodal_masses)
 
 
-def build_model(model_params, materials_list, outline_points_list, 
-                rebar_configs_list, section_params_list, material_params,
+def build_model(model_params, fiber_configs, material_params,
                 node_coords, boundary_conditions, element_configs,
-                spring_configs, nodal_spring_configs, diaphragm_list,
+                nodal_spring_configs, diaphragm_list,
                 load_configs, mass_configs, visualize, output_dir,
-                slab_configs, existing_frame_nodes):
-    """Build complete OpenSeesPy 3D frame model"""
+                slab_configs):
     
     os.makedirs(output_dir, exist_ok=True)
     
@@ -1189,104 +1525,43 @@ def build_model(model_params, materials_list, outline_points_list,
     print("BUILDING MODEL")
     print("="*80)
     
-    # Create fiber sections
-    print("\nCreating fiber sections...")
-    fiber_section_info = []
-    for i, (materials, outline_points, rebar_configs, section_params) in enumerate(
-        zip(materials_list, outline_points_list, rebar_configs_list, section_params_list)):
-        
-        sec_id, txt_path, png_path, pkl_path = create_fiber_section(
-            materials=materials,
-            outline_points=outline_points,
-            cover=section_params['cover'],
-            rebar_configs=rebar_configs,
-            mesh_size=section_params['mesh_size'],
-            mat_tags=section_params['mat_tags'],
-            sec_tag=section_params['sec_tag'],
-            G=section_params['G'],
-            save_prefix=os.path.join(output_dir, section_params['save_prefix']),
-            section_name=section_params['section_name']
-        )
-        
-        fiber_section_info.append({
-            'sec_tag': section_params['sec_tag'],
-            'txt_path': txt_path,
-            'png_path': png_path,
-            'pkl_path': pkl_path,
-            'GJ': section_params['G']
-        })
-    print(f"Created {len(fiber_section_info)} fiber sections")
+    complete_opensees_commands = []
     
-    # Initialize model
-    print("\nInitializing OpenSees model...")
     ops.wipe()
     ops.model("basic", "-ndm", model_params['ndm'], "-ndf", model_params['ndf'])
+    complete_opensees_commands.append(f"ops.wipe()")
+    complete_opensees_commands.append(f"ops.model('basic', '-ndm', {model_params['ndm']}, '-ndf', {model_params['ndf']})")
+    print("Model initialized")
     
     for mat_param in material_params:
         ops.uniaxialMaterial(*mat_param)
+        complete_opensees_commands.append(f"ops.uniaxialMaterial{tuple(mat_param)}")
     print("Materials defined")
     
-    # Create shell meshes
-    shell_results = []
-    if slab_configs:
-        print("\nCreating shell meshes...")
-        for i, config in enumerate(slab_configs, start=1):
-            config_name = config.get('name', f'Shell_{i}')
-            
-            mesh = create_slab(
-                boundary_nodes=config['boundary_nodes'],
-                mesh_size=config['mesh_size'],
-                internal_points=config['internal_points'],
-                voids=config['voids'],
-                py_file=os.path.join(output_dir, config['py_file']),
-                png_file=os.path.join(output_dir, config['png_file']),
-                shell_material_config=config['shell_material_config'],
-                shell_section_config=config['shell_section_config'],
-                node_font_size=config['node_font_size'],
-                element_font_size=config['element_font_size'],
-                ops_ele_type1=config['ops_ele_type1'],
-                ops_ele_type2=config['ops_ele_type2'],
-                shell_boundary_conditions=config['shell_boundary_conditions'],
-                use_zero_length=config['use_zero_length'],
-                zero_length_material_config=config['zero_length_material_config'],
-                zero_length_directions=config['zero_length_directions'],
-                zero_length_boundary_conditions=config['zero_length_boundary_conditions'],
-                element_start_id=config['element_start_id'],
-                spring_node_start_id=config['spring_node_start_id'],
-                load_configs=config['load_configs'],
-                start_node_id=config['start_node_id'],
-                start_element_id=config['start_element_id']
-            )
-            
-            mesh['config_name'] = config_name
-            shell_results.append(mesh)
-        
-        print(f"Created {len(shell_results)} shell meshes")
-    
-    # Create nodes
     print("\nCreating nodes...")
-    all_nodes_created = set()
-    
     for node_id, coords in node_coords.items():
         ops.node(node_id, *coords)
-        all_nodes_created.add(node_id)
+        complete_opensees_commands.append(f"ops.node({node_id}, {coords[0]}, {coords[1]}, {coords[2]})")
+    print(f"Created {len(node_coords)} nodes")
     
-    if shell_results:
-        for shell_mesh in shell_results:
-            for nid, coords in shell_mesh['nodes'].items():
-                if nid not in all_nodes_created:
-                    ops.node(nid, coords[0], coords[1], coords[2])
-                    all_nodes_created.add(nid)
+    print("\nCreating fiber sections...")
+    fiber_section_info = []
+    for i, fiber_config in enumerate(fiber_configs):
+        
+        sec_id, txt_path, png_path, pkl_path, params_path = create_fiber_section(
+            fiber_configs=fiber_config
+        )
+        
+        fiber_section_info.append({
+            'sec_tag': fiber_config['sec_tag'],
+            'txt_path': txt_path,
+            'png_path': png_path,
+            'pkl_path': pkl_path,
+            'params_path': params_path,
+            'GJ': fiber_config.get('G', 0.0)
+        })
+    print(f"Created {len(fiber_section_info)} fiber sections")
     
-    print(f"Created {len(all_nodes_created)} nodes")
-    
-    # Apply boundary conditions
-    print("\nApplying boundary conditions...")
-    for node_id, dofs in boundary_conditions.items():
-        ops.fix(node_id, *dofs)
-    print(f"Applied to {len(boundary_conditions)} nodes")
-    
-    # Create fiber sections in OpenSees
     print("\nCreating fiber sections in model...")
     for fiber_sec in fiber_section_info:
         commands, figure, loaded_section, loaded_sec_id, loaded_GJ, file_paths = load_saved_section(
@@ -1302,537 +1577,655 @@ def build_model(model_params, materials_list, outline_points_list,
             fiber_sec['GJ'] = loaded_GJ
         
         exec(commands)
+        
+        with open(fiber_sec['txt_path'], 'r') as f:
+            fiber_commands = f.read()
+        complete_opensees_commands.append(f"\n# Fiber Section {fiber_sec['sec_tag']}")
+        complete_opensees_commands.append(fiber_commands)
     print("Fiber sections created")
     
-    # Create springs
-    if nodal_spring_configs:
-        print("\nCreating support springs...")
-        zero_element_boundary_condition(
-            material_props=nodal_spring_configs['material_props'],
-            sections=nodal_spring_configs.get('sections', {}),
-            node_list=nodal_spring_configs['node_list'],
-            boundary_condition=nodal_spring_configs['boundary_condition'],
-            element_start_id=nodal_spring_configs['element_start_id'],
-            spring_node_start_id=nodal_spring_configs['spring_node_start_id']
-        )
-        print("Springs created")
+    print("\nCreating member elements...")
+    member_results = create_member_element(element_configs)
+    complete_opensees_commands.extend(member_results)
+    print(f"Created {len(member_results)} member elements")
     
-    # Create rigid diaphragms
+    shell_results = []
+    all_slab_ops_commands = []
+    slab_springs = []
+    slab_file_paths = {}
+    
+    if slab_configs:
+        print("\nCreating slabs...")
+        slab_creation_results = create_slab(slab_configs)
+        shell_results = slab_creation_results['meshes']
+        all_slab_ops_commands = slab_creation_results['ops_commands']
+        slab_springs = slab_creation_results['springs']
+        slab_file_paths = slab_creation_results['file_paths']
+        complete_opensees_commands.extend(all_slab_ops_commands)
+        print(f"Created {len(shell_results)} slabs")
+        print(f"Captured {len(all_slab_ops_commands)} OpenSees commands")
+    
     if diaphragm_list:
         print("\nCreating rigid diaphragms...")
         for perp_dir, ret_node, *constr_nodes in diaphragm_list:
             ops.rigidDiaphragm(perp_dir, ret_node, *constr_nodes)
+            complete_opensees_commands.append(f"ops.rigidDiaphragm({perp_dir}, {ret_node}, {', '.join(map(str, constr_nodes))})")
         print(f"Created {len(diaphragm_list)} diaphragms")
     
-    # Create beam elements
-    print("\nCreating beam elements...")
-    for transf in element_configs.get('transformations', []):
-        ops.geomTransf(transf['type'], transf['tag'], *transf['vecxz'])
+    print("\nApplying boundary conditions...")
+    apply_boundary_conditions(boundary_conditions)
+    for node_id, dofs in boundary_conditions.items():
+        complete_opensees_commands.append(f"ops.fix({node_id}, {', '.join(map(str, dofs))})")
+    print(f"Applied to {len(boundary_conditions)} nodes")
     
-    for integ in element_configs.get('integrations', []):
-        ops.beamIntegration(integ['type'], integ['tag'], integ['sec_tag'], integ['np'])
-    
-    for elastic_sec in element_configs.get('elastic_sections', []):
-        ops.section("Elastic", elastic_sec['sec_tag'], elastic_sec['E'],
-                   elastic_sec['A'], elastic_sec['Iz'], elastic_sec['Iy'],
-                   elastic_sec['G'], elastic_sec['J'])
-    
-    col_count = 0
-    for col in element_configs.get('force_beam_columns', []):
-        ops.element("forceBeamColumn", col['tag'], col['node_i'], col['node_j'], 
-                    col['transf_tag'], col['integ_tag'])
-        col_count += 1
-    
-    beam_count = 0
-    for beam in element_configs.get('elastic_beam_columns', []):
-        ops.element("elasticBeamColumn", beam['tag'], beam['node_i'], beam['node_j'],
-                    beam['A'], beam['E'], beam['G'], beam['J'], 
-                    beam['Iy'], beam['Iz'], beam['transf_tag'])
-        beam_count += 1
-    
-    print(f"Created {col_count} columns, {beam_count} beams")
-    
-    # Create shell elements
-    shell_ele_count = 0
-    if shell_results:
-        print("\nCreating shell elements...")
-        for shell_mesh in shell_results:
-            config_name = shell_mesh.get('config_name', 'Unknown')
-            
-            shell_mat_config = None
-            shell_sec_config = None
-            use_zero_length = False
-            zero_length_config = None
-            
-            for config in slab_configs:
-                if config.get('name') == config_name:
-                    shell_mat_config = config['shell_material_config']
-                    shell_sec_config = config['shell_section_config']
-                    use_zero_length = config['use_zero_length']
-                    if use_zero_length:
-                        zero_length_config = {
-                            'material_config': config['zero_length_material_config'],
-                            'directions': config['zero_length_directions'],
-                            'boundary_conditions': config['zero_length_boundary_conditions'],
-                            'element_start_id': config['element_start_id'],
-                            'spring_node_start_id': config['spring_node_start_id']
-                        }
-                    break
-            
-            if shell_mat_config is None or shell_sec_config is None:
-                continue
-            
-            sec_tag = shell_sec_config[1]
-            
-            try:
-                ops.nDMaterial(shell_mat_config[0], shell_mat_config[1], 
-                            shell_mat_config[2], shell_mat_config[3], shell_mat_config[4])
-            except:
-                pass
-            
-            try:
-                ops.section(shell_sec_config[0], shell_sec_config[1], 
-                        shell_sec_config[2], shell_sec_config[3])
-            except:
-                pass
-            
-            for elem in shell_mesh['quad4']:
-                ops.element("ShellMITC4", elem['tag'], *elem['nodes'], sec_tag)
-                shell_ele_count += 1
-            
-            for elem in shell_mesh['tri3']:
-                ops.element("ASDShellT3", elem['tag'], *elem['nodes'], sec_tag)
-                shell_ele_count += 1
-            
-            if use_zero_length and zero_length_config and zero_length_config['material_config']:
-                zero_mat_tag = zero_length_config['material_config'][1]
-                zero_length_material = {
-                    'id': zero_mat_tag,
-                    'directions': zero_length_config['directions'],
-                    'config': zero_length_config['material_config']
-                }
-                
-                node_list = [(nid, float(shell_mesh['nodes'][nid][0]), 
-                                float(shell_mesh['nodes'][nid][1]), 
-                                float(shell_mesh['nodes'][nid][2])) 
-                                for nid in shell_mesh['nodes'].keys()]
-                
-                zero_result = zero_element_boundary_condition(
-                    material_props=zero_length_material,
-                    sections={},
-                    node_list=node_list,
-                    boundary_condition=zero_length_config['boundary_conditions'],
-                    element_start_id=zero_length_config['element_start_id'],
-                    spring_node_start_id=zero_length_config['spring_node_start_id']
-                )
-                
-                shell_mesh['zero_length'] = zero_result
+    if nodal_spring_configs:
+        print("\nCreating support springs...")
+        spring_results = create_spring(nodal_spring_configs)
         
-        print(f"Created {shell_ele_count} shell elements")
+        # Record the actual spring creation commands
+        for config in nodal_spring_configs:
+            node1_tuple = config["node1"]
+            spring_id = config["spring_id"]
+            direction = config["direction"]
+            material_type, mat_tag, K = config["material"]
+            boundary_condition = config["boundary_condition"]
+            
+            node1_tag, x, y, z = node1_tuple
+            spring_node = 100000 + spring_id
+            
+            # Add commands to complete model
+            complete_opensees_commands.append(f"ops.node({spring_node}, {x}, {y}, {z})")
+            complete_opensees_commands.append(f"ops.fix({spring_node}, {', '.join(map(str, boundary_condition))})")
+            complete_opensees_commands.append(f"ops.uniaxialMaterial('{material_type}', {mat_tag}, {K})")
+            complete_opensees_commands.append(f"ops.element('zeroLength', {spring_id}, {node1_tag}, {spring_node}, '-mat', {mat_tag}, '-dir', {direction})")
+        
+        print(f"Created {len(spring_results)} springs")
     
-    # Apply loads and masses
-    load_configs_to_apply = load_configs if load_configs else None
-    mass_configs_to_apply = mass_configs if mass_configs else None
-    
-    if load_configs_to_apply or mass_configs_to_apply:
+    calculated_nodal_masses = {}
+    if load_configs or mass_configs:
         results = apply_loads_and_masses(
-            load_configs=load_configs_to_apply,
-            mass_configs=mass_configs_to_apply,
+            load_configs=load_configs,
+            mass_configs=mass_configs,
             shell_meshes=shell_results,
             slab_configs=slab_configs,
             element_configs=element_configs,
             node_coords=node_coords
         )
         calculated_nodal_masses = results.get('nodal_masses', {})
+        
+        if 'load_commands' in results:
+            complete_opensees_commands.extend(results['load_commands'])
+        
+        if 'mass_commands' in results:
+            complete_opensees_commands.extend(results['mass_commands'])
     
-    # Visualization
     if visualize:
         print("\nCreating visualization...")
-        try:
-            fig = opst.vis.plotly.plot_model(
-                show_node_numbering=False,
-                show_ele_numbering=False,
-                show_ele_hover=True,
-                style="surface",
-                show_bc=True,
-                bc_scale=0.5,
-                show_outline=True
-            )
-            
-            output_path = os.path.join(output_dir, "complete_model.html")
-            fig.write_html(output_path)
-            print(f"Saved: {output_path}")
-        except Exception as e:
-            print(f"Visualization error: {e}")
+        fig = opst.vis.plotly.plot_model(
+            show_node_numbering=False,
+            show_ele_numbering=False,
+            show_ele_hover=True,
+            style="surface",
+            show_bc=True,
+            bc_scale=0.5,
+            show_outline=True
+        )
+        output_path = os.path.join(output_dir, "complete_model.html")
+        fig.write_html(output_path)
+        print(f"Saved: {output_path}")
     
-    # Summary
     all_node_tags = ops.getNodeTags()
     all_ele_tags = ops.getEleTags()
+    
+    shell_ele_count = 0
+    if shell_results:
+        for shell_mesh in shell_results:
+            shell_ele_count += len(shell_mesh['quad4']) + len(shell_mesh['tri3'])
     
     print("\n" + "="*80)
     print("MODEL BUILD COMPLETE")
     print("="*80)
     print(f"Total Nodes: {len(all_node_tags)}")
     print(f"Total Elements: {len(all_ele_tags)}")
-    print(f"  Columns: {col_count}")
-    print(f"  Beams: {beam_count}")
-    print(f"  Shell: {shell_ele_count}")
+    print(f"  Members: {len(member_results)}")
+    print(f"  Shells: {shell_ele_count}")
     print("="*80)
     
-    # Generate complete model file
-    nodal_spring_configs_to_pass = None
-    for shell_mesh in shell_results:
-        if 'zero_length' in shell_mesh:
-            config_name = shell_mesh.get('config_name', '')
-            for slab_config in slab_configs:
-                if slab_config.get('name') == config_name:
-                    if slab_config['use_zero_length']:
-                        zero_mat_config = slab_config['zero_length_material_config']
-                        if zero_mat_config:
-                            nodal_spring_configs_to_pass = {
-                                'material_props': {
-                                    'id': zero_mat_config[1],
-                                    'directions': slab_config['zero_length_directions'],
-                                    'config': zero_mat_config
-                                },
-                                'node_list': [(nid, shell_mesh['nodes'][nid][0], 
-                                            shell_mesh['nodes'][nid][1], 
-                                            shell_mesh['nodes'][nid][2]) 
-                                            for nid in shell_mesh['nodes'].keys()],
-                                'boundary_condition': slab_config['zero_length_boundary_conditions'],
-                                'element_start_id': slab_config['element_start_id'],
-                                'spring_node_start_id': slab_config['spring_node_start_id']
-                            }
-                    break
-    
-    generate_complete_model_file(
-        output_filepath=os.path.join(output_dir, "final_complete_model.py"),
-        model_params=model_params,
-        fiber_section_info=fiber_section_info,
-        material_params=material_params,
-        node_coords=node_coords,
-        shell_meshes=shell_results,
-        slab_configs=slab_configs,
-        boundary_conditions=boundary_conditions,
-        element_configs=element_configs,
-        nodal_spring_configs=nodal_spring_configs_to_pass,
-        load_configs=load_configs,
-        mass_configs=mass_configs,
-        diaphragm_list=diaphragm_list,
-        calculated_nodal_masses=calculated_nodal_masses  # ADD THIS!
+    complete_model_path = os.path.join(output_dir, "complete_opensees_model.py")
+    with open(complete_model_path, 'w') as f:
+        f.write("import openseespy.opensees as ops\n")
+        f.write("import opstool as opst\n\n")
+        f.write("import numpy as np\n")
+        f.write("import matplotlib.pyplot as plt\n")
 
-    )
+        for cmd in complete_opensees_commands:
+            if cmd.strip():
+                f.write(cmd + "\n")
+    print(f"\nSaved complete model to: {complete_model_path}")
+    
+    visualization_path = os.path.join(output_dir, "complete_model.html") if visualize else None
+    
+    all_file_paths = {
+        'fiber_sections': [
+            {
+                'sec_tag': f['sec_tag'],
+                'txt': f['txt_path'],
+                'png': f['png_path'],
+                'pkl': f['pkl_path'],
+                'params': f['params_path']
+            } 
+            for f in fiber_section_info
+        ],
+        'slabs': slab_file_paths,
+        'complete_model': complete_model_path,
+        'visualization': visualization_path
+    }
     
     return {
         'fiber_sections': fiber_section_info,
         'shell_meshes': shell_results,
         'total_nodes': len(all_node_tags),
-        'total_elements': len(all_ele_tags)
+        'total_elements': len(all_ele_tags),
+        'slab_ops_commands': all_slab_ops_commands,
+        'slab_springs': slab_springs,
+        'member_results': member_results,
+        'complete_opensees_commands': complete_opensees_commands,
+        'all_file_paths': all_file_paths
     }
 
 
-def generate_complete_model_file(output_filepath, model_params, fiber_section_info,
-                                 material_params, node_coords, shell_meshes,
-                                 slab_configs, boundary_conditions, element_configs,
-                                 nodal_spring_configs, load_configs, mass_configs,
-                                 diaphragm_list, calculated_nodal_masses=None):
-    """Generate final_complete_model.py with all components"""
-    
-    with open(output_filepath, 'w') as f:
-        f.write('"""' + "\n")
-        f.write("Complete OpenSeesPy Model - Auto-Generated\n")
-        f.write("="*70 + "\n")
-        f.write('"""' + "\n\n")
-        
-        f.write("import openseespy.opensees as ops\n")
-        f.write("import opstool as opst\n")
-        f.write("import numpy as np\n\n")
-        
-        # Model initialization
-        f.write("# Model initialization\n")
-        f.write("print('Initializing model...')\n")
-        f.write("ops.wipe()\n")
-        f.write(f"ops.model('basic', '-ndm', {model_params['ndm']}, '-ndf', {model_params['ndf']})\n\n")
-        
-        # Uniaxial materials
-        f.write("# Uniaxial materials\n")
-        for mat_param in material_params:
-            mat_str = ", ".join([repr(p) for p in mat_param])
-            f.write(f"ops.uniaxialMaterial({mat_str})\n")
-        f.write(f"print('Defined {len(material_params)} materials')\n\n")
-        
-        # Fiber sections
-        f.write("# Fiber sections\n")
-        for fiber_sec in fiber_section_info:
-            with open(fiber_sec['txt_path'], 'r') as sec_file:
-                sec_commands = sec_file.read()
-            f.write(f"\n# Section {fiber_sec['sec_tag']}\n")
-            f.write(sec_commands)
-            f.write("\n")
-        f.write(f"print('Created {len(fiber_section_info)} fiber sections')\n\n")
-        
-        # Nodes
-        f.write("# Frame nodes\n")
-        for node_id, coords in sorted(node_coords.items()):
-            x, y, z = coords
-            f.write(f"ops.node({node_id}, {x}, {y}, {z})\n")
-        f.write(f"print('Created {len(node_coords)} frame nodes')\n\n")
-        
-        if shell_meshes:
-            f.write("# Shell nodes\n")
-            total_shell_nodes = 0
-            for shell_mesh in shell_meshes:
-                config_name = shell_mesh.get('config_name', 'Unknown')
-                f.write(f"\n# {config_name}\n")
-                for node_id, coords in sorted(shell_mesh['nodes'].items()):
-                    x, y, z = coords
-                    f.write(f"ops.node({node_id}, {x}, {y}, {z})\n")
-                total_shell_nodes += len(shell_mesh['nodes'])
-            f.write(f"print('Created {total_shell_nodes} shell nodes')\n\n")
-        
-        # Boundary conditions
-        f.write("# Boundary conditions\n")
-        for node_id, dofs in sorted(boundary_conditions.items()):
-            dof_str = ", ".join([str(d) for d in dofs])
-            f.write(f"ops.fix({node_id}, {dof_str})\n")
-        f.write(f"print('Applied BC to {len(boundary_conditions)} nodes')\n\n")
-        
-        # Rigid diaphragms
-        if diaphragm_list:
-            f.write("# Rigid diaphragms\n")
-            for perp_dir, ret_node, *constr_nodes in diaphragm_list:
-                constr_str = ", ".join([str(n) for n in constr_nodes])
-                f.write(f"ops.rigidDiaphragm({perp_dir}, {ret_node}, {constr_str})\n")
-            f.write(f"print('Created {len(diaphragm_list)} diaphragms')\n\n")
-        
-        # Transformations
-        f.write("# Geometric transformations\n")
-        for transf in element_configs.get('transformations', []):
-            vecxz_str = ", ".join([str(v) for v in transf['vecxz']])
-            f.write(f"ops.geomTransf('{transf['type']}', {transf['tag']}, {vecxz_str})\n")
-        f.write("\n")
-        
-        # Integrations
-        f.write("# Beam integrations\n")
-        for integ in element_configs.get('integrations', []):
-            f.write(f"ops.beamIntegration('{integ['type']}', {integ['tag']}, "
-                   f"{integ['sec_tag']}, {integ['np']})\n")
-        f.write("\n")
-        
-        # Elastic sections
-        if element_configs.get('elastic_sections'):
-            f.write("# Elastic sections\n")
-            for elastic_sec in element_configs.get('elastic_sections', []):
-                f.write(f"ops.section('Elastic', {elastic_sec['sec_tag']}, "
-                       f"{elastic_sec['E']}, {elastic_sec['A']}, "
-                       f"{elastic_sec['Iz']}, {elastic_sec['Iy']}, "
-                       f"{elastic_sec['G']}, {elastic_sec['J']})\n")
-            f.write("\n")
-        
-        # Beam/column elements
-        f.write("# Force beam columns\n")
-        for col in element_configs.get('force_beam_columns', []):
-            f.write(f"ops.element('forceBeamColumn', {col['tag']}, "
-                   f"{col['node_i']}, {col['node_j']}, "
-                   f"{col['transf_tag']}, {col['integ_tag']})\n")
-        
-        col_count = len(element_configs.get('force_beam_columns', []))
-        f.write(f"print('Created {col_count} columns')\n\n")
-        
-        f.write("# Elastic beam columns\n")
-        for beam in element_configs.get('elastic_beam_columns', []):
-            f.write(f"ops.element('elasticBeamColumn', {beam['tag']}, "
-                   f"{beam['node_i']}, {beam['node_j']}, "
-                   f"{beam['A']}, {beam['E']}, {beam['G']}, {beam['J']}, "
-                   f"{beam['Iy']}, {beam['Iz']}, {beam['transf_tag']})\n")
-        
-        beam_count = len(element_configs.get('elastic_beam_columns', []))
-        f.write(f"print('Created {beam_count} beams')\n\n")
-        
-        # Shell elements
-        if shell_meshes:
-            f.write("# Shell elements\n")
-            total_shell_elements = 0
-            
-            for shell_mesh in shell_meshes:
-                config_name = shell_mesh.get('config_name', 'Unknown')
-                
-                shell_mat_config = None
-                shell_sec_config = None
-                
-                for config in slab_configs:
-                    if config.get('name') == config_name:
-                        shell_mat_config = config['shell_material_config']
-                        shell_sec_config = config['shell_section_config']
-                        break
-                
-                if shell_mat_config is None or shell_sec_config is None:
-                    continue
-                
-                f.write(f"\n# {config_name}\n")
-                
-                mat_str = ", ".join([repr(p) for p in shell_mat_config])
-                f.write(f"ops.nDMaterial({mat_str})\n")
-                
-                sec_str = ", ".join([repr(p) for p in shell_sec_config])
-                f.write(f"ops.section({sec_str})\n\n")
-                
-                sec_tag = shell_sec_config[1]
-                
-                for elem in shell_mesh['quad4']:
-                    node_str = ", ".join([str(n) for n in elem['nodes']])
-                    f.write(f"ops.element('ShellMITC4', {elem['tag']}, {node_str}, {sec_tag})\n")
-                
-                if shell_mesh['tri3']:
-                    for elem in shell_mesh['tri3']:
-                        node_str = ", ".join([str(n) for n in elem['nodes']])
-                        f.write(f"ops.element('ASDShellT3', {elem['tag']}, {node_str}, {sec_tag})\n")
-                
-                elem_count = len(shell_mesh['quad4']) + len(shell_mesh['tri3'])
-                total_shell_elements += elem_count
-            
-            f.write(f"\nprint('Created {total_shell_elements} shell elements')\n\n")
-        
-        # Zero-length springs
-        if nodal_spring_configs:
-            f.write("# Zero-length springs\n")
-            
-            mat_config = nodal_spring_configs['material_props']['config']
-            mat_str = ", ".join([repr(p) for p in mat_config])
-            f.write(f"ops.uniaxialMaterial({mat_str})\n\n")
-            
-            mat_id = nodal_spring_configs['material_props']['id']
-            directions = nodal_spring_configs['material_props']['directions']
-            boundary_condition = nodal_spring_configs['boundary_condition']
-            element_start_id = nodal_spring_configs['element_start_id']
-            spring_node_start_id = nodal_spring_configs['spring_node_start_id']
-            
-            spring_count = 0
-            for i, (node_id, x, y, z) in enumerate(nodal_spring_configs['node_list']):
-                spring_node_id = spring_node_start_id + i
-                elem_id = element_start_id + i
-                
-                bc_str = ", ".join([str(d) for d in boundary_condition])
-                dir_str = ", ".join([str(d) for d in directions])
-                
-                f.write(f"ops.node({spring_node_id}, {x}, {y}, {z})\n")
-                f.write(f"ops.fix({spring_node_id}, {bc_str})\n")
-                f.write(f"ops.element('zeroLength', {elem_id}, {node_id}, {spring_node_id}, "
-                       f"'-mat', {mat_id}, '-dir', {dir_str})\n")
-                
-                spring_count += 1
-            
-            f.write(f"\nprint('Created {spring_count} springs')\n\n")
-        
-        # Loads
-        if load_configs:
-            f.write("# Loads\n")
-            
-            if 'time_series' in load_configs:
-                for ts in load_configs['time_series']:
-                    if ts['type'] == 'Linear':
-                        f.write(f"ops.timeSeries('Linear', {ts['tag']})\n")
-                    elif ts['type'] == 'Constant':
-                        f.write(f"ops.timeSeries('Constant', {ts['tag']})\n")
-                f.write("\n")
-            
-            if 'patterns' in load_configs:
-                for pattern in load_configs['patterns']:
-                    f.write(f"ops.pattern('Plain', {pattern['tag']}, {pattern['ts_tag']})\n")
-                f.write("\n")
-            
-            if 'nodal_loads' in load_configs:
-                for load_group in load_configs['nodal_loads']:
-                    for load in load_group['loads']:
-                        force_str = ", ".join([str(f) for f in load['forces']])
-                        f.write(f"ops.load({load['node']}, {force_str})\n")
-                f.write("\n")
-            
-            if 'beam_uniform_loads' in load_configs:
-                for load_group in load_configs['beam_uniform_loads']:
-                    for load in load_group['loads']:
-                        elem_str = str(load['elements'])
-                        f.write(f"opst.pre.transform_beam_uniform_load({elem_str}, "
-                               f"wy={load['wy']}, wz={load['wz']})\n")
-                f.write("\n")
-            
-            if 'beam_point_loads' in load_configs:
-                for load_group in load_configs['beam_point_loads']:
-                    for load in load_group['loads']:
-                        f.write(f"opst.pre.transform_beam_point_load([{load['element']}], "
-                               f"py={load['py']}, pz={load['pz']}, xl={load['xl']})\n")
-                f.write("\n")
-            
-            if 'shell_surface_loads' in load_configs:
-                for load_group in load_configs['shell_surface_loads']:
-                    for load in load_group['loads']:
-                        for shell_mesh in shell_meshes:
-                            if shell_mesh.get('config_name') == load['mesh_name']:
-                                if load['elements'] is None:
-                                    element_tags = [elem['tag'] for elem in shell_mesh['quad4']]
-                                    element_tags += [elem['tag'] for elem in shell_mesh['tri3']]
-                                else:
-                                    element_tags = load['elements']
-                                
-                                f.write(f"opst.pre.transform_surface_uniform_load("
-                                       f"ele_tags={element_tags}, p={load['pressure']})\n")
-                                break
-                f.write("\n")
-            
-            f.write("print('Loads applied')\n\n")
-        
-        # # Masses
-        # if mass_configs:
-        #     f.write("# Masses\n")
-        #     f.write("nodal_masses = {}\n\n")
-            
-        #     # ADD THIS: Beam/column mass calculation
-        #     if 'beam_column_mass' in mass_configs:
-        #         f.write("# Beam masses\n")
-        #         for item in mass_configs['beam_column_mass']:
-        #             f.write(f"# Element {item['tag']} mass calculation needed\n")
-        #         f.write("\n")
 
-        #     if 'nodal_mass' in mass_configs:
-        #         for item in mass_configs['nodal_mass']:
-        #             node_id = item['node']
-        #             mass_value = item['mass']
-        #             f.write(f"if {node_id} not in nodal_masses:\n")
-        #             f.write(f"    nodal_masses[{node_id}] = 0.0\n")
-        #             f.write(f"nodal_masses[{node_id}] += {mass_value}\n")
-        #         f.write("\n")
-            
-        #     f.write("for node_id, mass_value in nodal_masses.items():\n")
-        #     f.write("    if mass_value > 0:\n")
-        #     f.write("        ops.mass(node_id, mass_value, mass_value, mass_value, 0.0, 0.0, 0.0)\n\n")
-            
-        #     f.write("print('Masses applied')\n\n")
+# """
+# Complete Building Model Example - FINAL FIX
+# ============================================
+# Fixed duplicate time series/pattern tag issue
+# """
 
-        # Masses - using pre-calculated values
-        if calculated_nodal_masses:
-            f.write("# Masses (pre-calculated from model build)\n")
-            f.write("print('Applying pre-calculated masses...')\n")
-            
-            # Write ops.mass() commands for all nodes with mass > 0
-            for node_id, mass_value in sorted(calculated_nodal_masses.items()):
-                if mass_value > 0:
-                    f.write(f"ops.mass({node_id}, {mass_value}, {mass_value}, {mass_value}, 0.0, 0.0, 0.0)\n")
-            
-            f.write("print('Masses applied')\n\n")
-        else:
-            # Fallback to old method if no pre-calculated masses
-            f.write("# Masses (WARNING: Not pre-calculated)\n")
-            f.write("# This generated file cannot calculate beam/column masses\n")
-            f.write("# Run the original model build for proper mass calculation\n")
-            f.write("print('WARNING: Masses not properly calculated in this generated file')\n\n")
-        
-        # Footer
-        f.write("print('\\n' + '='*70)\n")
-        f.write("print('MODEL COMPLETE')\n")
-        f.write("print('='*70)\n")
-        f.write("print(f'Nodes: {len(ops.getNodeTags())}')\n")
-        f.write("print(f'Elements: {len(ops.getEleTags())}')\n")
-        f.write("print('='*70)\n")
+# import numpy as np
+# import openseespy.opensees as ops
+# import opstool as opst
+
+# # ============================================================================
+# # STEP 1: DEFINE MODEL PARAMETERS
+# # ============================================================================
+
+# model_params = {
+#     'ndm': 3,
+#     'ndf': 6
+# }
+
+# output_dir = './outputs100/building_model'  # Line 10 - CHANGE THIS
+# import os  # ADD THIS LINE
+# os.makedirs(output_dir, exist_ok=True)  # ADD THIS LINE
+
+# # ============================================================================
+# # STEP 2: DEFINE NODES
+# # ============================================================================
+
+# floor_height = 12.0  # ft
+# bay_x = 20.0  # ft
+# bay_y = 20.0  # ft
+
+# node_coords = {
+#     # Ground floor nodes (z=0)
+#     1: (0.0, 0.0, 0.0),
+#     2: (20.0, 0.0, 0.0),
+#     3: (20.0, 20.0, 0.0),
+#     4: (0.0, 20.0, 0.0),
     
-    print(f"\nGenerated: {output_filepath}")
+#     # First floor nodes (z=12)
+#     11: (0.0, 0.0, 12.0),
+#     12: (20.0, 0.0, 12.0),
+#     13: (20.0, 20.0, 12.0),
+#     14: (0.0, 20.0, 12.0)
+# }
+
+# # ============================================================================
+# # STEP 3: DEFINE UNIAXIAL MATERIALS
+# # ============================================================================
+
+# material_params = [
+#     ('Concrete01', 1, -4.0, -0.002, -0.5, -0.005),
+#     ('Concrete01', 2, -5.0, -0.002, -0.5, -0.005),
+#     ('Steel02', 3, 60.0, 29000.0, 0.01, 18.0, 0.925, 0.15),
+# ]
+
+# # ============================================================================
+# # STEP 4: DEFINE MATERIALS FOR FIBER SECTIONS
+# # ============================================================================
+
+# materials_col = {
+#     'concrete_core': {
+#         'elastic_modulus': 3600.0,
+#         'poissons_ratio': 0.2,
+#         'density': 0.0868,
+#         'color': '#88b378'
+#     },
+#     'concrete_cover': {
+#         'elastic_modulus': 3600.0,
+#         'poissons_ratio': 0.2,
+#         'density': 0.0868,
+#         'color': '#dbb40c'
+#     },
+#     'steel_rebar': {
+#         'elastic_modulus': 29000.0,
+#         'poissons_ratio': 0.3,
+#         'density': 0.490,
+#         'yield_strength': 60.0,
+#         'color': 'black'
+#     }
+# }
+
+# # ============================================================================
+# # STEP 5: DEFINE COLUMN FIBER SECTIONS
+# # ============================================================================
+
+# width_1 = 18.0 / 12.0
+# height_1 = 18.0 / 12.0
+# cover_1 = 1.5 / 12.0
+
+# outline_points_1 = [
+#     [-width_1/2, -height_1/2],
+#     [width_1/2, -height_1/2],
+#     [width_1/2, height_1/2],
+#     [-width_1/2, height_1/2]
+# ]
+
+# rebar_configs_1 = [
+#     {
+#         'type': 'line',
+#         'points': [[-width_1/2 + cover_1, -height_1/2 + cover_1],
+#                    [width_1/2 - cover_1, -height_1/2 + cover_1]],
+#         'dia': 1.0 / 12.0,
+#         'n': 3,
+#         'gap': None,
+#         'color': 'black'
+#     },
+#     {
+#         'type': 'line',
+#         'points': [[-width_1/2 + cover_1, height_1/2 - cover_1],
+#                    [width_1/2 - cover_1, height_1/2 - cover_1]],
+#         'dia': 1.0 / 12.0,
+#         'n': 3,
+#         'gap': None,
+#         'color': 'black'
+#     },
+#     {
+#         'type': 'line',
+#         'points': [[-width_1/2 + cover_1, -height_1/2 + cover_1],
+#                    [-width_1/2 + cover_1, height_1/2 - cover_1]],
+#         'dia': 1.0 / 12.0,
+#         'n': 2,
+#         'gap': None,
+#         'color': 'black'
+#     },
+#     {
+#         'type': 'line',
+#         'points': [[width_1/2 - cover_1, -height_1/2 + cover_1],
+#                    [width_1/2 - cover_1, height_1/2 - cover_1]],
+#         'dia': 1.0 / 12.0,
+#         'n': 2,
+#         'gap': None,
+#         'color': 'black'
+#     }
+# ]
+
+# fiber_config_1 = {
+#     'materials': materials_col,
+#     'outline_points': outline_points_1,
+#     'core_material': 'concrete_core',
+#     'mesh_sizes': 50,
+#     'ops_mat_tags': {
+#         'cover': 1,
+#         'core': 2,
+#         'rebar': 3
+#     },
+#     'cover_thickness': cover_1,
+#     'cover_material': 'concrete_cover',
+#     'rebar_configs': rebar_configs_1,
+#     'steel_material': 'steel_rebar',
+#     'sec_tag': 1,
+#     'G': 1500.0,
+#     'save_prefix': f'{output_dir}/column_18x18',
+#     'section_name': 'Column_18x18',
+#     'display_results': False,
+#     'plot_section': False
+# }
+
+# fiber_configs = [fiber_config_1]
+
+# # ============================================================================
+# # STEP 6: DEFINE COLUMNS AND BEAMS
+# # ============================================================================
+
+# element_configs = {
+#     'section': [
+#         {
+#             'type': 'Elastic',
+#             'secTag': 10,
+#             'E': 29000.0,
+#             'A': 17.9 / 144.0,
+#             'Iz': 800.0 / 1728.0,
+#             'Iy': 40.1 / 1728.0,
+#             'G': 11200.0,
+#             'J': 1.24 / 1728.0
+#         }
+#     ],
+#     'geomTransf': [
+#         {'type': 'PDelta', 'tag': 1, 'vecxz': [0, 1, 0]},
+#         {'type': 'Linear', 'tag': 2, 'vecxz': [0, 0, 1]}
+#     ],
+#     'element': [
+#         # Force beam columns (fiber sections)
+#         {
+#             'type': 'forceBeamColumn',
+#             'eleTag': 1,
+#             'eleNodes': [1, 11],
+#             'transfTag': 1,
+#             'integrationTag': 1
+#         },
+#         {
+#             'type': 'forceBeamColumn',
+#             'eleTag': 2,
+#             'eleNodes': [2, 12],
+#             'transfTag': 1,
+#             'integrationTag': 1
+#         },
+#         {
+#             'type': 'forceBeamColumn',
+#             'eleTag': 3,
+#             'eleNodes': [3, 13],
+#             'transfTag': 1,
+#             'integrationTag': 1
+#         },
+#         {
+#             'type': 'forceBeamColumn',
+#             'eleTag': 4,
+#             'eleNodes': [4, 14],
+#             'transfTag': 1,
+#             'integrationTag': 1
+#         },
+#         # Elastic beam columns
+#         {
+#             'type': 'elasticBeamColumn',
+#             'eleTag': 11,
+#             'eleNodes': [11, 12],
+#             'transfTag': 2,
+#             'Area': 17.9 / 144.0,
+#             'E': 29000.0,
+#             'G': 11200.0,
+#             'J': 1.24 / 1728.0,
+#             'Iy': 40.1 / 1728.0,
+#             'Iz': 800.0 / 1728.0
+#         },
+#         {
+#             'type': 'elasticBeamColumn',
+#             'eleTag': 12,
+#             'eleNodes': [12, 13],
+#             'transfTag': 2,
+#             'Area': 17.9 / 144.0,
+#             'E': 29000.0,
+#             'G': 11200.0,
+#             'J': 1.24 / 1728.0,
+#             'Iy': 40.1 / 1728.0,
+#             'Iz': 800.0 / 1728.0
+#         },
+#         {
+#             'type': 'elasticBeamColumn',
+#             'eleTag': 13,
+#             'eleNodes': [13, 14],
+#             'transfTag': 2,
+#             'Area': 17.9 / 144.0,
+#             'E': 29000.0,
+#             'G': 11200.0,
+#             'J': 1.24 / 1728.0,
+#             'Iy': 40.1 / 1728.0,
+#             'Iz': 800.0 / 1728.0
+#         },
+#         {
+#             'type': 'elasticBeamColumn',
+#             'eleTag': 14,
+#             'eleNodes': [14, 11],
+#             'transfTag': 2,
+#             'Area': 17.9 / 144.0,
+#             'E': 29000.0,
+#             'G': 11200.0,
+#             'J': 1.24 / 1728.0,
+#             'Iy': 40.1 / 1728.0,
+#             'Iz': 800.0 / 1728.0
+#         }
+#     ],
+#     'beamIntegration': [
+#         {'type': 'Lobatto', 'tag': 1, 'secTag': 1, 'N': 5}
+#     ]
+# }
+
+
+# # ============================================================================
+# # STEP 7: DEFINE SLAB
+# # ============================================================================
+
+# slab_boundary_nodes = {
+#     11: (0.0, 0.0, 12.0),      # NW column node at (0,0,12)
+#     12: (20.0, 0.0, 12.0),     # NE column node at (20,0,12)
+#     13: (20.0, 20.0, 12.0),    # SE column node at (20,20,12)
+#     14: (0.0, 20.0, 12.0)      # SW column node at (0,20,12)
+# }
+
+# # IMPORTANT: Use unique time series and pattern tags for slab (tags 1 and 1)
+# slab_boundary_nodes = {
+#     11: (0.0, 0.0, 12.0),      # NW column node at (0,0,12)
+#     12: (20.0, 0.0, 12.0),     # NE column node at (20,0,12)
+#     13: (20.0, 20.0, 12.0),    # SE column node at (20,20,12)
+#     14: (0.0, 20.0, 12.0)      # SW column node at (0,20,12)
+# }
+
+# slab_configs = [
+#     {
+#         'name': 'Floor_Slab',
+#         'boundary_nodes': slab_boundary_nodes,
+#         'mesh_size': 10.0,
+#         'internal_points': None,
+#         'voids': None,
+#         'py_file': './outputs/building_model/floor_slab_mesh.py',
+#         'png_file': './outputs/building_model/floor_slab_mesh.png',
+#         'shell_material_config': ('ElasticIsotropic', 100, 3600.0, 0.2, 0.0868),
+#         'shell_section_config': ('PlateFiber', 100, 'ShellMITC4', 0.6666666666666666),
+#         'node_font_size': 8,
+#         'element_font_size': 6,
+#         'ops_ele_type1': 'ShellMITC4',
+#         'ops_ele_type2': 'ShellNLDKGT',
+#         'shell_boundary_conditions': None,
+#         'spring_configs': None,
+#         'load_configs': {
+#             'time_series': [{'tag': 1, 'type': 'Linear'}],
+#             'patterns': [{'tag': 1, 'ts_tag': 1}],
+#             'shell_surface_loads': [{
+#                 'pattern': 1,
+#                 'loads': [{
+#                     'pressure': -0.050,
+#                     'elements': None
+#                 }]
+#             }],
+#             'nodal_loads': [{
+#                 'pattern': 1,
+#                 'loads': [
+#                     {'node': 11, 'forces': (0, 0, -2.0, 0, 0, 0)},  # NW column
+#                     {'node': 13, 'forces': (0, 0, -2.0, 0, 0, 0)}   # SE column
+#                 ]
+#             }]
+#         },
+#         'mass_configs': {
+#             'shell_element_mass': [{
+#                 'mass_per_area': 0.030,
+#                 'elements': None,
+#                 'description': 'SDL'
+#             }],
+#             'nodal_mass': [
+#                 {'node': 12, 'mass': 0.5},  # NE column
+#                 {'node': 14, 'mass': 0.5}   # SW column
+#             ]
+#         },
+#         'start_node_id': 100000,
+#         'start_element_id': 100000
+#     }
+# ]
+
+# # ============================================================================
+# # STEP 8: BOUNDARY CONDITIONS
+# # ============================================================================
+
+# boundary_conditions = {
+#     1: (1, 1, 1, 1, 1, 1),
+#     2: (1, 1, 1, 1, 1, 1),
+#     3: (1, 1, 1, 1, 1, 1),
+#     4: (1, 1, 1, 1, 1, 1)
+# }
+
+# # ============================================================================
+# # STEP 9: NODAL SPRINGS
+# # ============================================================================
+
+# nodal_spring_configs = [
+#     {
+#         "node1": (1, 0.0, 0.0, 0.0),
+#         "spring_id": 5001,
+#         "direction": 3,
+#         "material": ("Elastic", 6001, 10000.0),
+#         "boundary_condition": (1, 1, 1, 1, 1, 1)
+#     },
+#     {
+#         "node1": (2, bay_x, 0.0, 0.0),
+#         "spring_id": 5002,
+#         "direction": 3,
+#         "material": ("Elastic", 6002, 10000.0),
+#         "boundary_condition": (1, 1, 1, 1, 1, 1)
+#     },
+#     {
+#         "node1": (3, bay_x, bay_y, 0.0),
+#         "spring_id": 5003,
+#         "direction": 3,
+#         "material": ("Elastic", 6003, 10000.0),
+#         "boundary_condition": (1, 1, 1, 1, 1, 1)
+#     },
+#     {
+#         "node1": (4, 0.0, bay_y, 0.0),
+#         "spring_id": 5004,
+#         "direction": 3,
+#         "material": ("Elastic", 6004, 10000.0),
+#         "boundary_condition": (1, 1, 1, 1, 1, 1)
+#     }
+# ]
+
+# # ============================================================================
+# # STEP 10: RIGID DIAPHRAGM
+# # ============================================================================
+
+# diaphragm_list = [
+#     (3, 11, 12, 13, 14)
+# ]
+
+# # ============================================================================
+# # STEP 11: LOADS AND MASSES FOR BEAMS AND COLUMNS
+# # NOTE: Use DIFFERENT tags than slab (slab uses tag 1, beams use tag 2)
+# # ============================================================================
+
+# load_configs = {
+#     'time_series': [],  # EMPTY - slab already creates timeSeries 1
+#     'patterns': [],     # EMPTY - slab already creates pattern 1
+    
+#     'beam_uniform_loads': [{
+#         'pattern': 1,  # Use existing pattern 1 from slab
+#         'loads': [
+#             {'elements': [11, 12, 13, 14], 'wy': 0.0, 'wz': -0.5}
+#         ]
+#     }],
+    
+#     'nodal_loads': [{
+#         'pattern': 1,  # Use existing pattern 1 from slab
+#         'loads': [
+#             {'node': 11, 'forces': (0, 0, -5.0, 0, 0, 0)},
+#             {'node': 12, 'forces': (0, 0, -5.0, 0, 0, 0)},
+#             {'node': 13, 'forces': (0, 0, -5.0, 0, 0, 0)},
+#             {'node': 14, 'forces': (0, 0, -5.0, 0, 0, 0)}
+#         ]
+#     }]
+# }
+
+# mass_configs = {
+#     'beam_column_mass': [
+#         {'tag': 1, 'density': 0.0868, 'area': 2.25},
+#         {'tag': 2, 'density': 0.0868, 'area': 2.25},
+#         {'tag': 3, 'density': 0.0868, 'area': 2.25},
+#         {'tag': 4, 'density': 0.0868, 'area': 2.25}
+#     ],
+#     'beam_additional_mass': [{
+#         'element_tags': [11, 12, 13, 14],
+#         'mass_per_length': 0.050,
+#         'description': 'Steel beam self-weight'
+#     }],
+#     'nodal_mass': [
+#         {'node': 11, 'mass': 1.0},
+#         {'node': 12, 'mass': 1.0},
+#         {'node': 13, 'mass': 1.0},
+#         {'node': 14, 'mass': 1.0}
+#     ]
+# }
+# # ============================================================================
+# # STEP 12: BUILD MODEL
+# # ============================================================================
+
+# if __name__ == "__main__":
+    
+#     print("="*80)
+#     print("BUILDING COMPLETE STRUCTURE MODEL")
+#     print("="*80)
+#     print("\nModel Configuration:")
+#     print(f"  - Nodes: {len(node_coords)}")
+#     # Count forceBeamColumn elements
+#     column_count = len([e for e in element_configs['element'] if e['type'] == 'forceBeamColumn'])
+#     print(f"  - Columns: {column_count}")
+
+#     # Count elasticBeamColumn elements
+#     beam_count = len([e for e in element_configs['element'] if e['type'] == 'elasticBeamColumn'])
+#     print(f"  - Beams: {beam_count}")
+#     print(f"  - Slabs: {len(slab_configs)}")
+#     print(f"  - Fiber Sections: {len(fiber_configs)}")
+#     print(f"  - Uniaxial Materials: {len(material_params)}")
+#     print(f"  - Springs: {len(nodal_spring_configs)}")
+#     print(f"  - Diaphragms: {len(diaphragm_list)}")
+#     print("\nNOTE: Slab creates TimeSeries 1 and Pattern 1")
+#     print("      Beam/column loads reuse Pattern 1")
+    
+#     # Call build_model
+#     results = build_model(
+#         model_params=model_params,
+#         fiber_configs=fiber_configs,
+#         material_params=material_params,
+#         node_coords=node_coords,
+#         boundary_conditions=boundary_conditions,
+#         element_configs=element_configs,
+#         nodal_spring_configs=nodal_spring_configs,
+#         diaphragm_list=diaphragm_list,
+#         load_configs=load_configs,
+#         mass_configs=mass_configs,
+#         visualize=True,
+#         output_dir=output_dir,
+#         slab_configs=slab_configs
+#     )
+    
+#     print("\n" + "="*80)
+#     print("MODEL BUILD SUMMARY")
+#     print("="*80)
+#     print(f"Total Nodes: {results['total_nodes']}")
+#     print(f"Total Elements: {results['total_elements']}")
+    
+#     print("\nGenerated Files:")
+#     print(f"Complete Model: {results['all_file_paths']['complete_model']}")
+#     print(f"Visualization: {results['all_file_paths']['visualization']}")
+    
+#     print("\n" + "="*80)
+#     print("✅ SUCCESS - MODEL BUILD COMPLETE")
+#     print("="*80)
+
 
